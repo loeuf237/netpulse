@@ -1,0 +1,13 @@
+{
+  "name": "NetPulse",
+  "description": "Indicateur de débit réseau en temps réel dans la barre supérieure, totaux de session et contrôle du proxy TUN (Style Internet Speed Meter & GlassWire)",
+  "uuid": "force-proxy@paulin",
+  "shell-version": [
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
+  "version": 2
+}

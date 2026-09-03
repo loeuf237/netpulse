@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1f2438"/>
+      <stop offset="50%" stop-color="#131624"/>
+      <stop offset="100%" stop-color="#0a0b12"/>
+    </linearGradient>
+
+    <!-- Border Gradient -->
+    <linearGradient id="borderGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4f5b82" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#1a1d2e" stop-opacity="0.8"/>
+    </linearGradient>
+
+    <!-- Pulse Wave Gradient -->
+    <linearGradient id="pulseGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#3584e4"/>
+      <stop offset="30%" stop-color="#00f0ff"/>
+      <stop offset="70%" stop-color="#2ecc71"/>
+      <stop offset="100%" stop-color="#57e389"/>
+    </linearGradient>
+
+    <!-- Glowing Node Gradient -->
+    <radialGradient id="nodeGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00f0ff" stop-opacity="1"/>
+      <stop offset="40%" stop-color="#00f0ff" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#00f0ff" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Radar Circle Gradient -->
+    <linearGradient id="radarGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3584e4" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#2ecc71" stop-opacity="0.15"/>
+    </linearGradient>
+
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+
+    <filter id="softShadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <!-- Shadow & App Squircle -->
+  <g filter="url(#softShadow)">
+    <rect x="36" y="36" width="440" height="440" rx="105" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="4"/>
+  </g>
+
+  <!-- Background Radar / Network concentric rings -->
+  <circle cx="256" cy="256" r="155" fill="none" stroke="url(#radarGrad)" stroke-width="2.5" stroke-dasharray="6 6"/>
+  <circle cx="256" cy="256" r="105" fill="none" stroke="url(#radarGrad)" stroke-width="2" stroke-opacity="0.4"/>
+  <circle cx="256" cy="256" r="55" fill="none" stroke="url(#radarGrad)" stroke-width="1.5" stroke-opacity="0.3"/>
+
+  <!-- Subtle Network Nodes -->
+  <circle cx="145" cy="180" r="6" fill="#3584e4" opacity="0.6"/>
+  <line x1="145" y1="180" x2="180" y2="220" stroke="#3584e4" stroke-width="1.5" opacity="0.3"/>
+  
+  <circle cx="365" cy="170" r="6" fill="#2ecc71" opacity="0.6"/>
+  <line x1="365" y1="170" x2="325" y2="220" stroke="#2ecc71" stroke-width="1.5" opacity="0.3"/>
+
+  <circle cx="350" cy="340" r="5" fill="#00f0ff" opacity="0.5"/>
+  <circle cx="160" cy="335" r="5" fill="#3584e4" opacity="0.5"/>
+
+  <!-- Central Pulse Wave (ECG / Network Traffic Spike) -->
+  <!-- Shadow of wave for 3D depth -->
+  <path d="M 65 256 L 155 256 L 195 210 L 225 315 L 265 145 L 305 345 L 335 220 L 365 256 L 447 256" 
+        fill="none" stroke="#000000" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" opacity="0.35" transform="translate(0, 8)"/>
+
+  <!-- Glow layer -->
+  <path d="M 65 256 L 155 256 L 195 210 L 225 315 L 265 145 L 305 345 L 335 220 L 365 256 L 447 256" 
+        fill="none" stroke="url(#pulseGrad)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)" opacity="0.85"/>
+
+  <!-- Crisp foreground wave -->
+  <path d="M 65 256 L 155 256 L 195 210 L 225 315 L 265 145 L 305 345 L 335 220 L 365 256 L 447 256" 
+        fill="none" stroke="url(#pulseGrad)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Peak Glow Nodes on wave -->
+  <circle cx="265" cy="145" r="24" fill="url(#nodeGlow)"/>
+  <circle cx="265" cy="145" r="9" fill="#ffffff" stroke="#00f0ff" stroke-width="3"/>
+
+  <circle cx="305" cy="345" r="20" fill="url(#nodeGlow)"/>
+  <circle cx="305" cy="345" r="8" fill="#ffffff" stroke="#2ecc71" stroke-width="3"/>
+
+  <!-- Up & Down Arrows Accents (Download / Upload speed symbol) -->
+  <g transform="translate(256, 405)" opacity="0.9">
+    <!-- Down Arrow (Green) -->
+    <path d="M -30 -8 L -30 6 M -35 1 L -30 6 L -25 1" fill="none" stroke="#2ecc71" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- Up Arrow (Cyan/Blue) -->
+    <path d="M 30 6 L 30 -8 M 25 -3 L 30 -8 L 35 -3" fill="none" stroke="#00f0ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
