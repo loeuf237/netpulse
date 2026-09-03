@@ -95,6 +95,15 @@ netpulse/
 │   ├── netpulse-monitor        # Démon de surveillance d'arrière-plan
 │   ├── netpulse-ctl            # Outil de commande système (TUN, pare-feu)
 │   └── tun2socks               # Binaire de routage réseau TUN transparent
+├── src/                        # Code source Python modulaire du projet
+│   └── netpulse/
+│       ├── __init__.py         # Initialisation du module et métadonnées de version
+│       ├── constants.py        # Chemins et paramètres par défaut
+│       ├── gui.py              # Code source de l'interface GTK4 / Libadwaita
+│       ├── monitor.py          # Code source du moteur d'analyse réseau
+│       └── ctl.sh              # Code source du script de contrôle système
+├── pyproject.toml              # Fichier de packaging Python moderne
+├── setup.py                    # Script d'installation de paquet standard
 ├── desktop/
 │   └── netpulse.desktop        # Lanceur de bureau XDG
 ├── icons/

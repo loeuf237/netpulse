@@ -903,6 +903,10 @@ class NetPulseApp(Adw.Application):
         win.present()
 
 
-if __name__ == "__main__":
+def main():
     app = NetPulseApp()
     sys.exit(app.run(sys.argv))
+
+
+if __name__ == "__main__":
+    main()

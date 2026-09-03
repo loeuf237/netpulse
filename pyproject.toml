@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netpulse"
+version = "1.0.0"
+description = "Moniteur Réseau en Temps Réel, Pare-feu Applicatif 1-Clic et Forçage Proxy TUN pour Linux (GNOME/Libadwaita)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [
+    { name = "paulin" }
+]
+dependencies = [
+    "psutil>=5.9.0",
+    "PyGObject>=3.42.0",
+]
+
+[project.scripts]
+netpulse = "netpulse.gui:main"
+netpulse-gui = "netpulse.gui:main"
+netpulse-monitor = "netpulse.monitor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

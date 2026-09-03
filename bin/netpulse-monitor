@@ -742,7 +742,7 @@ class NetPulseEngine:
         loop.run()
 
 
-if __name__ == "__main__":
+def main():
     if "--reset" in sys.argv:
         with open(RESET_FLAG_PATH, "w") as f:
             f.write("1")
@@ -751,3 +751,7 @@ if __name__ == "__main__":
 
     engine = NetPulseEngine()
     engine.run()
+
+
+if __name__ == "__main__":
+    main()
