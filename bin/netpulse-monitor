@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 NetPulse Monitor Daemon (GlassWire + Internet Speed Meter Engine)
-- Mesure le débit global sur l'interface physique réelle (ex: wlp0s20f3) pour éviter le double/triple comptage avec TUN et loopback.
+- Mesure le débit global sur toutes les interfaces physiques réelles (exclut TUN et loopback).
+- Fonctionne en permanence que le mode TUN soit activé ou non.
 - Extrait les statistiques réseau réelles de chaque socket par PID via tcp_info (ss -tipn).
 - Résolution asynchrone DNS inverse pour afficher les adresses IP ET les noms d'hôtes de serveurs.
 - Surveillance du pare-feu applicatif (application killswitch).
-- Publication StatusNotifierItem (icône système / notifications) et fichier JSON.
+- Publication des métriques dans /tmp/netpulse_stats.json avec écriture atomique sécurisée.
+- Mode tray (StatusNotifierItem) activable optionnellement via --tray (désactivé par défaut pour éviter les doublons).
 """
 
 import os
@@ -18,14 +20,24 @@ import subprocess
 import signal
 import threading
 import re
+import ctypes
 from collections import deque
 import psutil
+
+# Nom de processus propre pour GNOME System Monitor ("Ressources")
+try:
+    libc = ctypes.CDLL(None)
+    libc.prctl(15, b"netpulse-mon", 0, 0, 0)
+except Exception:
+    pass
 
 import gi
 gi.require_version('Gio', '2.0')
 gi.require_version('GLib', '2.0')
-gi.require_version('Dbusmenu', '0.4')
-from gi.repository import Gio, GLib, Dbusmenu
+from gi.repository import Gio, GLib
+
+GLib.set_prgname("netpulse-monitor")
+GLib.set_application_name("NetPulse Monitor")
 
 CONFIG_DIR = os.path.expanduser("~/.config/force-proxy")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -85,22 +97,20 @@ DEFAULT_CONFIG = {
 }
 
 
-def get_physical_interface():
-    """Détecte l'interface réseau physique réelle (passerelle par défaut)."""
-    try:
-        out = subprocess.check_output(['ip', '-4', 'route', 'show', 'default'], text=True)
-        parts = out.split()
-        if 'dev' in parts:
-            idx = parts.index('dev')
-            dev = parts[idx + 1]
-            if dev != 'tun-proxy' and dev != 'lo':
-                return dev
-    except Exception:
-        pass
-    for nic in psutil.net_io_counters(pernic=True).keys():
-        if nic != 'lo' and not nic.startswith('tun'):
-            return nic
-    return 'wlp0s20f3'
+def get_network_io():
+    """Calcule le trafic total cumulé sur toutes les interfaces physiques réelles.
+    Exclut strictement loopback ('lo') et les interfaces de tunnels/conteneurs ('tun*', 'tap*', 'docker*').
+    Fonctionne en tout temps, que le mode TUN soit actif ou non.
+    """
+    pernic = psutil.net_io_counters(pernic=True)
+    tot_recv = 0
+    tot_sent = 0
+    for nic, stat in pernic.items():
+        if nic == "lo" or nic.startswith(("tun", "tap", "veth", "docker", "virbr", "br-")):
+            continue
+        tot_recv += stat.bytes_recv
+        tot_sent += stat.bytes_sent
+    return tot_recv, tot_sent
 
 
 def load_config():
@@ -256,21 +266,20 @@ def parse_socket_traffic():
 
 
 class NetPulseEngine:
-    def __init__(self):
+    def __init__(self, enable_tray=False):
         self.config = load_config()
-        self.physical_if = get_physical_interface()
+        self.enable_tray = enable_tray
 
         self.session_start = time.time()
         self.last_time = self.session_start
 
-        # Measure starting bytes strictly on physical interface
-        cur_pernic = psutil.net_io_counters(pernic=True)
-        self.last_phys_io = cur_pernic.get(self.physical_if) or psutil.net_io_counters()
+        # Starting bytes across all physical interfaces
+        self.last_rx, self.last_tx = get_network_io()
 
         self.session_rx = 0
         self.session_tx = 0
 
-        # Per-process tracking: pid -> {'last_recv': int, 'last_sent': int, 'tot_rx': int, 'tot_tx': int}
+        # Per-process tracking
         self.proc_traffic_history = {}
         self.proxy_active = False
 
@@ -286,9 +295,17 @@ class NetPulseEngine:
         # Initialize firewall rules
         self._init_firewall()
 
-        # DBus setup
-        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        self._init_dbus_sni()
+        # Only initialize DBus SNI tray icon if explicitly requested via --tray
+        if self.enable_tray:
+            try:
+                gi.require_version('Dbusmenu', '0.4')
+                from gi.repository import Dbusmenu
+                self.Dbusmenu = Dbusmenu
+                self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+                self._init_dbus_sni()
+            except Exception as e:
+                print(f"Tray initialization note: {e}", file=sys.stderr)
+                self.enable_tray = False
 
     def _init_firewall(self):
         try:
@@ -307,6 +324,15 @@ class NetPulseEngine:
                 os.remove(RESET_FLAG_PATH)
             except Exception:
                 pass
+
+    def quit(self):
+        """Ferme NetPulse proprement."""
+        try:
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
+        except Exception:
+            pass
+        sys.exit(0)
 
     def _init_dbus_sni(self):
         node = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
@@ -361,60 +387,69 @@ class NetPulseEngine:
         )
 
         # Dbusmenu Server
-        self.menu_server = Dbusmenu.Server.new("/MenuBar")
-        self.menu_root = Dbusmenu.Menuitem.new()
+        self.menu_server = self.Dbusmenu.Server.new("/MenuBar")
+        self.menu_root = self.Dbusmenu.Menuitem.new()
 
-        self.mi_down = Dbusmenu.Menuitem.new()
+        self.mi_down = self.Dbusmenu.Menuitem.new()
         self.mi_down.property_set("label", "📥 Réception : 0 o/s")
         self.mi_down.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_down)
 
-        self.mi_up = Dbusmenu.Menuitem.new()
+        self.mi_up = self.Dbusmenu.Menuitem.new()
         self.mi_up.property_set("label", "📤 Envoi : 0 o/s")
         self.mi_up.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_up)
 
-        sep1 = Dbusmenu.Menuitem.new()
+        sep1 = self.Dbusmenu.Menuitem.new()
         sep1.property_set("type", "separator")
         self.menu_root.child_append(sep1)
 
-        self.mi_tot_rx = Dbusmenu.Menuitem.new()
+        self.mi_tot_rx = self.Dbusmenu.Menuitem.new()
         self.mi_tot_rx.property_set("label", "Total reçu : 0 o")
         self.mi_tot_rx.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_tot_rx)
 
-        self.mi_tot_tx = Dbusmenu.Menuitem.new()
+        self.mi_tot_tx = self.Dbusmenu.Menuitem.new()
         self.mi_tot_tx.property_set("label", "Total envoyé : 0 o")
         self.mi_tot_tx.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_tot_tx)
 
-        self.mi_dur = Dbusmenu.Menuitem.new()
+        self.mi_dur = self.Dbusmenu.Menuitem.new()
         self.mi_dur.property_set("label", "Durée : 00:00")
         self.mi_dur.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_dur)
 
-        sep2 = Dbusmenu.Menuitem.new()
+        sep2 = self.Dbusmenu.Menuitem.new()
         sep2.property_set("type", "separator")
         self.menu_root.child_append(sep2)
 
-        self.mi_proxy = Dbusmenu.Menuitem.new()
+        self.mi_proxy = self.Dbusmenu.Menuitem.new()
         self.mi_proxy.property_set("label", "⚡ Forcer le Proxy (Mode TUN) : Inactif")
         self.mi_proxy.connect("item-activated", lambda mi, ts: self.toggle_proxy())
         self.menu_root.child_append(self.mi_proxy)
 
-        sep3 = Dbusmenu.Menuitem.new()
+        sep3 = self.Dbusmenu.Menuitem.new()
         sep3.property_set("type", "separator")
         self.menu_root.child_append(sep3)
 
-        mi_open = Dbusmenu.Menuitem.new()
+        mi_open = self.Dbusmenu.Menuitem.new()
         mi_open.property_set("label", "🖥️ Ouvrir NetPulse...")
         mi_open.connect("item-activated", lambda mi, ts: self.open_gui())
         self.menu_root.child_append(mi_open)
 
-        mi_reset = Dbusmenu.Menuitem.new()
-        mi_reset.property_set("label", "🔄 Réinitialiser les compteurs de session")
+        mi_reset = self.Dbusmenu.Menuitem.new()
+        mi_reset.property_set("label", "🔄 Réinitialiser les données de session")
         mi_reset.connect("item-activated", lambda mi, ts: self.reset_session())
         self.menu_root.child_append(mi_reset)
+
+        sep4 = self.Dbusmenu.Menuitem.new()
+        sep4.property_set("type", "separator")
+        self.menu_root.child_append(sep4)
+
+        mi_quit = self.Dbusmenu.Menuitem.new()
+        mi_quit.property_set("label", "🛑 Quitter NetPulse")
+        mi_quit.connect("item-activated", lambda mi, ts: self.quit())
+        self.menu_root.child_append(mi_quit)
 
         self.menu_server.set_root(self.menu_root)
 
@@ -430,8 +465,8 @@ class NetPulseEngine:
                 None
             )
             watcher.RegisterStatusNotifierItem("(s)", "/StatusNotifierItem")
-        except Exception as e:
-            print(f"Watcher registration warning: {e}", file=sys.stderr)
+        except Exception:
+            pass
 
     def open_gui(self):
         try:
@@ -454,19 +489,20 @@ class NetPulseEngine:
                 was_active = self.proxy_active
                 self.proxy_active = bool(data.get("active"))
                 proxy_name = data.get("proxy", "TUN")
-                if self.proxy_active:
-                    self.mi_proxy.property_set("label", f"⚡ Forcer le Proxy : ACTIF ({proxy_name})")
-                else:
-                    self.mi_proxy.property_set("label", "⚡ Forcer le Proxy (Mode TUN) : Inactif")
+                if self.enable_tray and hasattr(self, "mi_proxy"):
+                    if self.proxy_active:
+                        self.mi_proxy.property_set("label", f"⚡ Forcer le Proxy : ACTIF ({proxy_name})")
+                    else:
+                        self.mi_proxy.property_set("label", "⚡ Forcer le Proxy (Mode TUN) : Inactif")
 
-                if was_active != self.proxy_active:
-                    self.bus.emit_signal(
-                        None,
-                        "/StatusNotifierItem",
-                        "org.kde.StatusNotifierItem",
-                        "NewIcon",
-                        None
-                    )
+                    if was_active != self.proxy_active:
+                        self.bus.emit_signal(
+                            None,
+                            "/StatusNotifierItem",
+                            "org.kde.StatusNotifierItem",
+                            "NewIcon",
+                            None
+                        )
         except Exception:
             pass
 
@@ -478,17 +514,11 @@ class NetPulseEngine:
         dt = max(now - self.last_time, 0.001)
 
         # -------------------------------------------------------------
-        # 1. Global network I/O: STRICTLY ON PHYSICAL INTERFACE
-        # (Avoids double/triple counting tun-proxy and loopback)
+        # 1. Global network I/O: ALL PHYSICAL INTERFACES (Excludes TUN & lo)
         # -------------------------------------------------------------
-        cur_pernic = psutil.net_io_counters(pernic=True)
-        cur_phys_io = cur_pernic.get(self.physical_if)
-        if not cur_phys_io:
-            self.physical_if = get_physical_interface()
-            cur_phys_io = cur_pernic.get(self.physical_if) or psutil.net_io_counters()
-
-        rx_diff = max(cur_phys_io.bytes_recv - self.last_phys_io.bytes_recv, 0)
-        tx_diff = max(cur_phys_io.bytes_sent - self.last_phys_io.bytes_sent, 0)
+        cur_rx, cur_tx = get_network_io()
+        rx_diff = max(cur_rx - self.last_rx, 0)
+        tx_diff = max(cur_tx - self.last_tx, 0)
 
         rx_speed = rx_diff / dt
         tx_speed = tx_diff / dt
@@ -496,7 +526,8 @@ class NetPulseEngine:
         self.session_rx += rx_diff
         self.session_tx += tx_diff
 
-        self.last_phys_io = cur_phys_io
+        self.last_rx = cur_rx
+        self.last_tx = cur_tx
         self.last_time = now
 
         # Add to historical buffer for graph
@@ -524,7 +555,6 @@ class NetPulseEngine:
         # -------------------------------------------------------------
         current_socket_traffic = parse_socket_traffic()
 
-        # Update per-process rates and cumulative session stats
         proc_live_rates = {}
         for pid, sinfo in current_socket_traffic.items():
             hist = self.proc_traffic_history.get(pid, {
@@ -534,7 +564,6 @@ class NetPulseEngine:
                 'tot_tx': 0
             })
 
-            # Calculate byte delta since last check
             p_rx_diff = max(sinfo['recv'] - hist['last_recv'], 0)
             p_tx_diff = max(sinfo['sent'] - hist['last_sent'], 0)
 
@@ -598,7 +627,6 @@ class NetPulseEngine:
                 if pname.lower() in blocked_apps and pid not in cgroup_blocked_pids:
                     subprocess.Popen([CTL_BIN, "block", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                # Real socket rates
                 prate = proc_live_rates.get(pid, {'rx_speed': 0.0, 'tx_speed': 0.0, 'tot_rx': 0, 'tot_tx': 0})
                 p_rx_speed = prate['rx_speed']
                 p_tx_speed = prate['tx_speed']
@@ -617,7 +645,6 @@ class NetPulseEngine:
                 else:
                     status_text = f"Actif ({len(c_list)})"
 
-                # Detailed socket connections list & DNS reverse resolution
                 conn_details = []
                 contacted_hosts = set()
 
@@ -666,14 +693,15 @@ class NetPulseEngine:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        # Sort by live rate, then total transferred, then connections count
         process_list.sort(key=lambda x: (x["rx_speed"] + x["tx_speed"], x["total_rx"] + x["total_tx"], x["connections_count"]), reverse=True)
+
+        self.check_proxy_status()
 
         payload = {
             "timestamp": now,
             "session_start": self.session_start,
             "session_duration_sec": session_duration,
-            "physical_interface": self.physical_if,
+            "proxy_active": self.proxy_active,
             "rx_speed": rx_speed,
             "tx_speed": tx_speed,
             "rx_speed_formatted": self.cur_rx_formatted,
@@ -688,8 +716,8 @@ class NetPulseEngine:
             "processes": process_list
         }
 
-        # Save JSON atomically
-        tmp_target = f"{STATS_PATH}.tmp"
+        # Écriture atomique avec fichier temporaire unique par PID (évite les conflits)
+        tmp_target = f"{STATS_PATH}.{os.getpid()}.tmp"
         try:
             with open(tmp_target, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
@@ -697,26 +725,23 @@ class NetPulseEngine:
         except Exception as e:
             print(f"Error saving stats: {e}", file=sys.stderr)
 
-        # Update DBus menu
-        self.mi_down.property_set("label", f"📥 Réception : {self.cur_rx_formatted}")
-        self.mi_up.property_set("label", f"📤 Envoi : {self.cur_tx_formatted}")
-        self.mi_tot_rx.property_set("label", f"Total reçu : {self.cur_tot_rx_formatted}")
-        self.mi_tot_tx.property_set("label", f"Total envoyé : {self.cur_tot_tx_formatted}")
-        self.mi_dur.property_set("label", f"Durée de session : {self.cur_duration_str}")
+        if self.enable_tray:
+            try:
+                self.mi_down.property_set("label", f"📥 Réception : {self.cur_rx_formatted}")
+                self.mi_up.property_set("label", f"📤 Envoi : {self.cur_tx_formatted}")
+                self.mi_tot_rx.property_set("label", f"Total reçu : {self.cur_tot_rx_formatted}")
+                self.mi_tot_tx.property_set("label", f"Total envoyé : {self.cur_tot_tx_formatted}")
+                self.mi_dur.property_set("label", f"Durée de session : {self.cur_duration_str}")
 
-        self.check_proxy_status()
-
-        # Emit NewToolTip
-        try:
-            self.bus.emit_signal(
-                None,
-                "/StatusNotifierItem",
-                "org.kde.StatusNotifierItem",
-                "NewToolTip",
-                None
-            )
-        except Exception:
-            pass
+                self.bus.emit_signal(
+                    None,
+                    "/StatusNotifierItem",
+                    "org.kde.StatusNotifierItem",
+                    "NewToolTip",
+                    None
+                )
+            except Exception:
+                pass
 
         return True
 
@@ -726,7 +751,8 @@ class NetPulseEngine:
 
         def handle_term(sig, frame):
             try:
-                os.remove(PID_FILE)
+                if os.path.exists(PID_FILE):
+                    os.remove(PID_FILE)
             except Exception:
                 pass
             sys.exit(0)
@@ -749,7 +775,8 @@ def main():
         print("Demande de réinitialisation envoyée au moniteur.")
         sys.exit(0)
 
-    engine = NetPulseEngine()
+    enable_tray = "--tray" in sys.argv
+    engine = NetPulseEngine(enable_tray=enable_tray)
     engine.run()
 
 

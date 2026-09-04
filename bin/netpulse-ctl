@@ -43,6 +43,7 @@ Pare-feu Applicatif (GlassWire Killswitch) :
 Général :
   gui, open                Ouvrir l'interface graphique NetPulse
   reset-session            Réinitialiser les compteurs de session réseau (débits / volumes)
+  quit, exit               Fermer complètement NetPulse (démon, interface et proxy)
   help, -h, --help         Afficher cette aide
 
 Exemples :
@@ -51,6 +52,14 @@ Exemples :
   $CMD_NAME block-app steam
   $CMD_NAME unblock-app steam
 EOF
+}
+
+get_status() {
+    local running=1
+    if pgrep -f "tun2socks.*${TUN_NAME}" >/dev/null 2>&1 && ip link show "${TUN_NAME}" >/dev/null 2>&1 && ip route show 0.0.0.0/1 2>/dev/null | grep -q "${TUN_NAME}"; then
+        running=0
+    fi
+    return $running
 }
 
 # Commandes exécutables immédiatement sans droits root
@@ -64,18 +73,22 @@ case "$1" in
         exit 0
         ;;
     reset-session|reset)
-        /home/paulin/.local/bin/force-proxy-monitor --reset
+        /home/paulin/.local/bin/netpulse-monitor --reset 2>/dev/null || /home/paulin/.local/bin/force-proxy-monitor --reset 2>/dev/null || true
+        exit 0
+        ;;
+    quit|exit)
+        echo "Fermeture complète de NetPulse..."
+        systemctl --user stop netpulse-monitor.service 2>/dev/null || true
+        systemctl --user stop force-proxy-monitor.service 2>/dev/null || true
+        pkill -f netpulse-gui 2>/dev/null || true
+        pkill -f force-proxy-gui 2>/dev/null || true
+        if get_status; then
+            "$REAL_SCRIPT" stop 2>/dev/null || true
+        fi
+        echo "NetPulse arrêté avec succès."
         exit 0
         ;;
 esac
-
-get_status() {
-    local running=1
-    if pgrep -f "tun2socks.*${TUN_NAME}" >/dev/null 2>&1 && ip link show "${TUN_NAME}" >/dev/null 2>&1 && ip route show 0.0.0.0/1 2>/dev/null | grep -q "${TUN_NAME}"; then
-        running=0
-    fi
-    return $running
-}
 
 read_gnome_proxy() {
     local socks_host socks_port http_host http_port
@@ -125,14 +138,27 @@ if [ "$1" = "status" ]; then
 fi
 
 # -------------------------------------------------------------
-# 2. PRIVILEGE ESCALATION ONLY FOR START / STOP / TOGGLE
+# 2. PRIVILEGE ESCALATION ONLY FOR ACTIONS REQUIRING ROOT
 # -------------------------------------------------------------
 if [ "$(id -u)" -ne 0 ]; then
+    # 1. Try passwordless sudo first (configured via /etc/sudoers.d/netpulse)
     if sudo -n "$REAL_SCRIPT" check-sudo >/dev/null 2>&1; then
         exec sudo "$REAL_SCRIPT" "$@"
-    else
+    fi
+
+    # 2. If running interactively in a terminal, prompt via sudo in the terminal
+    if [ -t 0 ] || [ -t 1 ]; then
+        exec sudo "$REAL_SCRIPT" "$@"
+    fi
+
+    # 3. If explicitly requested with GUI prompt flag (from interactive GUI click)
+    if [ "$NETPULSE_ALLOW_GUI_PROMPT" = "1" ]; then
         exec pkexec "$REAL_SCRIPT" "$@"
     fi
+
+    # 4. In background / daemon / boot mode, NEVER pop up graphical pkexec prompts!
+    echo "NetPulse: Privilèges root requis pour cette commande, mais la session est non-interactive et sudo sans mot de passe n'est pas encore actif." >&2
+    exit 1
 fi
 
 # -------------------------------------------------------------
@@ -197,13 +223,12 @@ case "$1" in
         sudo -u "$TARGET_USER" systemctl --user set-environment http_proxy="$proxy_arg" https_proxy="$proxy_arg" all_proxy="$proxy_arg" 2>/dev/null || true
 
         
-        # Configure snap daemon proxy and refresh store
-        if [ -n "$http_host" ] && [ -n "$http_port" ]; then
-            snap set system proxy.http="http://${http_host}:${http_port}" proxy.https="http://${http_host}:${http_port}" 2>/dev/null || true
+        # Configure snap daemon proxy if HTTP proxy is used
+        if echo "$proxy_arg" | grep -qE '^https?://'; then
+            snap set system proxy.http="$proxy_arg" proxy.https="$proxy_arg" 2>/dev/null || true
         fi
         pkill -f "/snap/snap-store" 2>/dev/null || true
 
-        bash /tmp/test_snapd.sh
         echo "Succès: Tout le trafic du PC est désormais forcé vers $proxy_arg"
         exit 0
         ;;
@@ -274,11 +299,12 @@ case "$1" in
                 orig_cg=$(cat "/tmp/net_blocked_orig_cg/$target_pid")
                 rm -f "/tmp/net_blocked_orig_cg/$target_pid"
             fi
+            target_uid=$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)
             if [ -n "$orig_cg" ] && [ -d "/sys/fs/cgroup$orig_cg" ]; then
                 echo "$target_pid" > "/sys/fs/cgroup$orig_cg/cgroup.procs" 2>/dev/null || true
             else
-                echo "$target_pid" > /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/cgroup.procs 2>/dev/null || \
-                echo "$target_pid" > /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.procs 2>/dev/null || true
+                echo "$target_pid" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/app.slice/cgroup.procs" 2>/dev/null || \
+                echo "$target_pid" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/cgroup.procs" 2>/dev/null || true
             fi
             echo "PID $target_pid débloqué avec succès."
             exit 0
@@ -298,8 +324,9 @@ case "$1" in
                 echo "$app_name" >> "$BLOCKED_FILE"
             fi
             chown -R "$TARGET_USER:$TARGET_USER" "$BLOCKED_DIR" 2>/dev/null || true
-            # Block all running instances
-            for p in $(pgrep -f "$app_name" 2>/dev/null); do
+            # Block all running instances matching exact process name
+            pids=$(pgrep -x "$app_name" 2>/dev/null || pgrep "$app_name" 2>/dev/null)
+            for p in $pids; do
                 "$REAL_SCRIPT" block "$p" >/dev/null 2>&1 || true
             done
             echo "Application $app_name bloquée."
@@ -315,8 +342,9 @@ case "$1" in
             if [ -f "$BLOCKED_FILE" ]; then
                 sed -i "/^$app_name$/d" "$BLOCKED_FILE" 2>/dev/null || true
             fi
-            # Unblock all running instances
-            for p in $(pgrep -f "$app_name" 2>/dev/null); do
+            # Unblock all running instances matching exact process name
+            pids=$(pgrep -x "$app_name" 2>/dev/null || pgrep "$app_name" 2>/dev/null)
+            for p in $pids; do
                 "$REAL_SCRIPT" unblock "$p" >/dev/null 2>&1 || true
             done
             echo "Application $app_name débloquée."
@@ -348,8 +376,9 @@ case "$1" in
         ;;
 
     update-sudoers)
-        echo "paulin ALL=(ALL) NOPASSWD: /home/paulin/.local/bin/force-proxy-ctl, /home/paulin/.local/bin/netpulse-ctl" > /etc/sudoers.d/force-proxy
-        chmod 440 /etc/sudoers.d/force-proxy
+        echo "$TARGET_USER ALL=(ALL) NOPASSWD: /home/$TARGET_USER/.local/bin/netpulse-ctl, /home/$TARGET_USER/.local/bin/force-proxy-ctl" > /etc/sudoers.d/netpulse
+        echo "$TARGET_USER ALL=(ALL) NOPASSWD: /home/$TARGET_USER/.local/bin/netpulse-ctl, /home/$TARGET_USER/.local/bin/force-proxy-ctl" > /etc/sudoers.d/force-proxy
+        chmod 440 /etc/sudoers.d/netpulse /etc/sudoers.d/force-proxy 2>/dev/null || true
         echo "Configuration sudoers mise à jour avec succès."
         exit 0
         ;;

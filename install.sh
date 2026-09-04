@@ -103,6 +103,11 @@ fi
 # 7. Activation du service d'arrière-plan (systemd user)
 echo "[7/7] Démarrage du service d'arrière-plan..."
 mkdir -p "$SYSTEMD_USER_DIR"
+systemctl --user stop force-proxy-monitor.service 2>/dev/null || true
+systemctl --user disable force-proxy-monitor.service 2>/dev/null || true
+rm -f "$SYSTEMD_USER_DIR/force-proxy-monitor.service"
+rm -f "$SYSTEMD_USER_DIR/default.target.wants/force-proxy-monitor.service"
+
 cp "$SCRIPT_DIR/systemd/netpulse-monitor.service" "$SYSTEMD_USER_DIR/netpulse-monitor.service"
 systemctl --user daemon-reload
 systemctl --user enable --now netpulse-monitor.service

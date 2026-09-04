@@ -13,7 +13,14 @@ import sys
 import json
 import subprocess
 import threading
+import ctypes
 import gi
+
+try:
+    libc = ctypes.CDLL(None)
+    libc.prctl(15, b"netpulse", 0, 0, 0)
+except Exception:
+    pass
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
@@ -23,6 +30,9 @@ gi.require_version('GObject', '2.0')
 gi.require_version('Gdk', '4.0')
 
 from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gdk
+
+GLib.set_prgname("netpulse")
+GLib.set_application_name("NetPulse")
 
 CONFIG_PATH = os.path.expanduser("~/.config/force-proxy/config.json")
 BLOCKED_FILE = os.path.expanduser("~/.config/force-proxy/blocked_apps.txt")
@@ -568,16 +578,26 @@ class NetPulseWindow(Adw.ApplicationWindow):
             currently_blocked = True
 
         action = "unblock-app" if currently_blocked else "block-app"
-        try:
-            subprocess.run([self.ctl_bin, action, app_name], check=False)
-            if not currently_blocked:
-                toast = Adw.Toast.new(f"Application « {app_name} » bloquée par le pare-feu.")
-            else:
-                toast = Adw.Toast.new(f"Application « {app_name} » débloquée.")
-            self.toast_overlay.add_toast(toast)
-            self._poll_stats()
-        except Exception as e:
-            print(f"Error toggling block: {e}", file=sys.stderr)
+
+        def worker():
+            try:
+                env = os.environ.copy()
+                env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
+                subprocess.run([self.ctl_bin, action, app_name], env=env, check=False)
+
+                def on_done():
+                    if not currently_blocked:
+                        toast = Adw.Toast.new(f"Application « {app_name} » bloquée par le pare-feu.")
+                    else:
+                        toast = Adw.Toast.new(f"Application « {app_name} » débloquée.")
+                    self.toast_overlay.add_toast(toast)
+                    self._poll_stats()
+
+                GLib.idle_add(on_done)
+            except Exception as e:
+                print(f"Error toggling block: {e}", file=sys.stderr)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # -----------------------------------------------------------------
     # ONGLET 2 : SERVEUR MANDATAIRE & FORÇAGE TUN
@@ -854,7 +874,9 @@ class NetPulseWindow(Adw.ApplicationWindow):
 
         def run_action():
             try:
-                subprocess.run([self.ctl_bin, action], check=False)
+                env = os.environ.copy()
+                env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
+                subprocess.run([self.ctl_bin, action], env=env, check=False)
             finally:
                 def finish():
                     self.is_busy = False

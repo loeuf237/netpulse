@@ -20,7 +20,7 @@ class NetSpeedButton extends PanelMenu.Button {
         this._guiBin = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'netpulse-gui']);
         this._monBin = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'netpulse-monitor']);
 
-        // Panel Bar Layout: [Icon] [Label with Download/Upload]
+        // Panel Bar Layout: [NetPulse Icon] [Speed Label]
         const box = new St.BoxLayout({
             style_class: 'panel-status-menu-box',
             x_expand: true,
@@ -36,7 +36,7 @@ class NetSpeedButton extends PanelMenu.Button {
         this._speedLabel = new St.Label({
             text: '↓ 0 o/s  ↑ 0 o/s',
             y_align: Clutter.ActorAlign.CENTER,
-            style: 'font-family: monospace; font-size: 11px; margin-left: 4px; font-weight: bold;',
+            style: 'font-family: monospace; font-size: 11px; margin-left: 5px; font-weight: bold;',
         });
         box.add_child(this._speedLabel);
 
@@ -58,7 +58,7 @@ class NetSpeedButton extends PanelMenu.Button {
         // 2. Session Totals
         const sessionSection = new PopupMenu.PopupMenuSection();
         this._sessionHeader = new PopupMenu.PopupMenuItem(_('📊 Données échangées (Session) :'), {reactive: false});
-        this._sessionHeader.actor.add_style_class_name('popup-subtitle-menu-item');
+        this._sessionHeader.label.style = 'font-weight: bold; color: #8b949e;';
         sessionSection.addMenuItem(this._sessionHeader);
 
         this._sessionRxItem = new PopupMenu.PopupMenuItem(_('Total reçu : 0 o'), {reactive: false});
@@ -72,7 +72,7 @@ class NetSpeedButton extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // 3. Proxy & TUN Control
-        this._proxySwitch = new PopupMenu.PopupSwitchMenuItem(_('Forcer le Proxy (Mode TUN)'), false);
+        this._proxySwitch = new PopupMenu.PopupSwitchMenuItem(_('⚡ Forcer le Proxy (Mode TUN)'), false);
         this._proxySwitch.connect('toggled', (item, state) => {
             const action = state ? 'start' : 'stop';
             GLib.spawn_command_line_async(`${this._ctlBin} ${action}`);
@@ -82,17 +82,26 @@ class NetSpeedButton extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // 4. Quick Actions
-        const openAppItem = new PopupMenu.PopupMenuItem(_('🖥️ Moniteur Réseau & Applications (GlassWire)...'));
+        const openAppItem = new PopupMenu.PopupMenuItem(_('🖥️ Ouvrir NetPulse...'));
         openAppItem.connect('activate', () => {
             GLib.spawn_command_line_async(this._guiBin);
         });
         this.menu.addMenuItem(openAppItem);
 
-        const resetItem = new PopupMenu.PopupMenuItem(_('🔄 Réinitialiser les données de session'));
+        const resetItem = new PopupMenu.PopupMenuItem(_('🔄 Réinitialiser les compteurs'));
         resetItem.connect('activate', () => {
             GLib.spawn_command_line_async(`${this._monBin} --reset`);
         });
         this.menu.addMenuItem(resetItem);
+
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        // 5. Quit Action
+        const quitItem = new PopupMenu.PopupMenuItem(_('🛑 Quitter NetPulse'));
+        quitItem.connect('activate', () => {
+            GLib.spawn_command_line_async(`${this._ctlBin} quit`);
+        });
+        this.menu.addMenuItem(quitItem);
 
         // Start periodic update loop
         this._update();
@@ -135,30 +144,18 @@ class NetSpeedButton extends PanelMenu.Button {
 
                     const dur = this._formatDuration(data.session_duration_sec || 0);
                     this._sessionDurationItem.label.text = `Durée de session : ${dur}`;
+
+                    if ('proxy_active' in data) {
+                        const isActive = !!data.proxy_active;
+                        if (this._proxySwitch.state !== isActive) {
+                            this._proxySwitch.setToggleState(isActive);
+                        }
+                    }
                 }
             } catch (e) {
-                // ignore transient file read error
+                // ignore transient read
             }
         });
-
-        // Check proxy state asynchronously
-        try {
-            const [ok, out] = GLib.spawn_command_line_sync(`${this._ctlBin} status --json`);
-            if (ok && out) {
-                const pdata = JSON.parse(new TextDecoder().decode(out));
-                const isActive = !!pdata.active;
-                if (this._proxySwitch.state !== isActive) {
-                    this._proxySwitch.setToggleState(isActive);
-                }
-                if (isActive) {
-                    this._icon.icon_name = 'network-vpn-symbolic';
-                } else {
-                    this._icon.icon_name = 'network-transmit-receive-symbolic';
-                }
-            }
-        } catch (e) {
-            // ignore
-        }
     }
 
     destroy() {
