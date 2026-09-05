@@ -197,18 +197,47 @@ case "$1" in
             ip route add "$proxy_ip" via "$default_gw" dev "$default_if" metric 5 2>/dev/null || true
         fi
 
-        # 3. Create TUN interface
-        ip tuntap add dev "${TUN_NAME}" mode tun
-        ip addr add 198.18.0.1/15 dev "${TUN_NAME}"
-        ip link set dev "${TUN_NAME}" up
+        # 3. Create TUN interface with optimized MTU for mobile hotspot / VPN encapsulation
+        # MTU 1400 prevents packet fragmentation on WireGuard/OpenVPN phone tunnels
+        ip tuntap add dev "${TUN_NAME}" mode tun 2>/dev/null || true
+        ip addr add 198.18.0.1/15 dev "${TUN_NAME}" 2>/dev/null || true
+        ip link set dev "${TUN_NAME}" mtu 1400 up
 
-        # 4. Start tun2socks with correct double-dash flags
+        # Apply TCP MSS clamping to prevent PMTU blackholes
+        iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+        # Optimize kernel TCP stack for proxy throughput and mobile network jitter
+        sysctl -q -w net.ipv4.tcp_mtu_probing=1 2>/dev/null || true
+        sysctl -q -w net.core.rmem_max=16777216 2>/dev/null || true
+        sysctl -q -w net.core.wmem_max=16777216 2>/dev/null || true
+        sysctl -q -w net.ipv4.tcp_rmem="4096 87380 16777216" 2>/dev/null || true
+        sysctl -q -w net.ipv4.tcp_wmem="4096 65536 16777216" 2>/dev/null || true
+        sysctl -q -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true
+        sysctl -q -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
+
+        # Configure DNS: Route DNS queries to the phone hotspot gateway for 40ms resolution
+        if [ -n "$default_gw" ] && [ -n "$default_if" ]; then
+            resolvectl dns "$default_if" "$default_gw" 2>/dev/null || true
+            resolvectl default-route "$default_if" yes 2>/dev/null || true
+        fi
+
+        # 4. Start tun2socks with high-throughput auto-tuning & large netstack buffers
         if [ ! -x "$TUN2SOCKS_BIN" ]; then
             echo "Erreur: Binaire tun2socks introuvable à $TUN2SOCKS_BIN" >&2
             exit 1
         fi
 
-        nohup "$TUN2SOCKS_BIN" --device "tun://${TUN_NAME}" --proxy "$proxy_arg" --interface "$default_if" --loglevel info > "$LOG_FILE" 2>&1 &
+        nohup "$TUN2SOCKS_BIN" \
+            --device "tun://${TUN_NAME}" \
+            --proxy "$proxy_arg" \
+            --interface "$default_if" \
+            --mtu 1400 \
+            --tcp-auto-tuning \
+            --tcp-rcvbuf 4m \
+            --tcp-sndbuf 4m \
+            --udp-timeout 30s \
+            --loglevel info > "$LOG_FILE" 2>&1 &
         echo $! > "$PID_FILE"
         echo "$proxy_arg" > "$STATE_FILE"
 
@@ -256,6 +285,17 @@ case "$1" in
         pkill -9 -f "tun2socks.*${TUN_NAME}" 2>/dev/null || true
         rm -f "$PID_FILE" "$STATE_FILE"
 
+        # Remove TCP MSS clamping
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+        # Revert DNS to default DHCP
+        def_line=$(ip -4 route show default | head -n 1)
+        default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+        if [ -n "$default_if" ]; then
+            resolvectl revert "$default_if" 2>/dev/null || true
+        fi
+
         # Remove TUN device
         ip link set dev "${TUN_NAME}" down 2>/dev/null || true
         ip tuntap del dev "${TUN_NAME}" mode tun 2>/dev/null || true
@@ -270,8 +310,57 @@ case "$1" in
         exit 0
         ;;
 
-    
-    
+    optimize|tune)
+        echo "Application des optimisations de débit pour Every Proxy / Hotspot mobile..."
+        def_line=$(ip -4 route show default | head -n 1)
+        default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+        default_gw=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
+
+        # 1. Update MTU on tun-proxy
+        if ip link show "${TUN_NAME}" >/dev/null 2>&1; then
+            ip link set dev "${TUN_NAME}" mtu 1400 2>/dev/null || true
+        fi
+
+        # 2. MSS clamping
+        iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+        # 3. Kernel TCP optimizations
+        sysctl -q -w net.ipv4.tcp_mtu_probing=1 2>/dev/null || true
+        sysctl -q -w net.core.rmem_max=16777216 2>/dev/null || true
+        sysctl -q -w net.core.wmem_max=16777216 2>/dev/null || true
+        sysctl -q -w net.ipv4.tcp_rmem="4096 87380 16777216" 2>/dev/null || true
+        sysctl -q -w net.ipv4.tcp_wmem="4096 65536 16777216" 2>/dev/null || true
+        sysctl -q -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true
+        sysctl -q -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
+
+        # 4. Direct DNS via phone gateway
+        if [ -n "$default_gw" ] && [ -n "$default_if" ]; then
+            resolvectl dns "$default_if" "$default_gw" 2>/dev/null || true
+            resolvectl default-route "$default_if" yes 2>/dev/null || true
+        fi
+
+        # 5. Hot-reload tun2socks seamlessly if running
+        if [ -f "$STATE_FILE" ] && ip link show "${TUN_NAME}" >/dev/null 2>&1; then
+            curr_proxy=$(cat "$STATE_FILE")
+            pkill -9 -f "tun2socks.*${TUN_NAME}" 2>/dev/null || true
+            nohup "$TUN2SOCKS_BIN" \
+                --device "tun://${TUN_NAME}" \
+                --proxy "$curr_proxy" \
+                --interface "$default_if" \
+                --mtu 1400 \
+                --tcp-auto-tuning \
+                --tcp-rcvbuf 4m \
+                --tcp-sndbuf 4m \
+                --udp-timeout 30s \
+                --loglevel info > "$LOG_FILE" 2>&1 &
+            echo $! > "$PID_FILE"
+        fi
+
+        echo "Optimisations appliquées avec succès."
+        exit 0
+        ;;
+
     block)
         target_pid="$2"
         if [ -n "$target_pid" ] && [ -d "/proc/$target_pid" ]; then
