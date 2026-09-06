@@ -10,6 +10,7 @@ Interface GTK4 / Libadwaita moderne à 3 onglets :
 
 import os
 import sys
+import time
 import json
 import subprocess
 import threading
@@ -177,6 +178,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
 
         self.updating_switch = False
         self.is_busy = False
+        self.user_toggled_at = 0.0
+        self.target_force_state = None
         self.search_filter = ""
         self.filter_blocked_only = False
         self.current_processes = []
@@ -866,17 +869,32 @@ class NetPulseWindow(Adw.ApplicationWindow):
             return
 
         want_active = self.force_switch_row.get_active()
+        if want_active and not self.enable_proxy_row.get_active():
+            self.enable_proxy_row.set_active(True)
         self._save_gsettings(show_toast=False)
 
         action = "start" if want_active else "stop"
+        cmd = [self.ctl_bin, action]
+        if want_active:
+            socks_h = self.socks_host_entry.get_text().strip()
+            socks_p = int(self.socks_port_spin.get_value())
+            http_h = self.http_host_entry.get_text().strip()
+            http_p = int(self.http_port_spin.get_value())
+            if socks_h and socks_p > 0:
+                cmd.append(f"socks5://{socks_h}:{socks_p}")
+            elif http_h and http_p > 0:
+                cmd.append(f"http://{http_h}:{http_p}")
+
         self.is_busy = True
+        self.user_toggled_at = time.time()
+        self.target_force_state = want_active
         self.tun_status_row.set_subtitle("Activation du mode TUN..." if want_active else "Désactivation...")
 
         def run_action():
             try:
                 env = os.environ.copy()
                 env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
-                subprocess.run([self.ctl_bin, action], env=env, check=False)
+                subprocess.run(cmd, env=env, check=False)
             finally:
                 def finish():
                     self.is_busy = False
@@ -895,7 +913,18 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 is_active = bool(data.get("active"))
                 proxy_target = data.get("proxy", "Inconnu")
 
-                if self.force_switch_row.get_active() != is_active:
+                now = time.time()
+                toggled_at = getattr(self, "user_toggled_at", 0.0)
+                target_state = getattr(self, "target_force_state", None)
+
+                should_update = True
+                if (now - toggled_at) < 6.0 and target_state is not None:
+                    if is_active == target_state:
+                        self.user_toggled_at = 0.0
+                    else:
+                        should_update = False
+
+                if should_update and self.force_switch_row.get_active() != is_active:
                     self.updating_switch = True
                     self.force_switch_row.set_active(is_active)
                     self.updating_switch = False

@@ -108,6 +108,8 @@ read_gnome_proxy() {
         echo "socks5://${socks_host}:${socks_port}"
     elif [ -n "$http_host" ] && [ -n "$http_port" ] && [ "$http_port" -gt 0 ] 2>/dev/null; then
         echo "http://${http_host}:${http_port}"
+    elif [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE" 2>/dev/null
     fi
 }
 
@@ -176,10 +178,19 @@ case "$1" in
             exit 1
         fi
 
-        # Extract gateway & default physical interface
-        def_line=$(ip -4 route show default | head -n 1)
+        # Extract physical gateway & interface, ignoring virtual tun/tap/wireguard interfaces
+        def_line=$(ip -4 route show default | grep -E "dev (wl|en|eth|wlan|lan)" | head -n 1)
+        if [ -z "$def_line" ]; then
+            def_line=$(ip -4 route show | grep -E "dev (wl|en|eth|wlan|lan)" | grep -E "via|default" | head -n 1)
+        fi
+        if [ -z "$def_line" ]; then
+            def_line=$(ip -4 route show default | head -n 1)
+        fi
         default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
         default_gw=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
+        if [ -z "$default_gw" ] && [ -n "$default_if" ]; then
+            default_gw=$(ip -4 route show dev "$default_if" 2>/dev/null | awk '/default via/ {print $3}' | head -n 1)
+        fi
         proxy_ip=$(echo "$proxy_arg" | sed -E 's|.*://([^:/]+).*|\1|')
 
         echo "Configuration du proxy forcé..."
@@ -194,7 +205,7 @@ case "$1" in
 
         # 2. Add explicit route to proxy server via physical gateway to avoid routing loops
         if [ -n "$default_gw" ] && [ -n "$default_if" ] && [ -n "$proxy_ip" ]; then
-            ip route add "$proxy_ip" via "$default_gw" dev "$default_if" metric 5 2>/dev/null || true
+            ip route replace "$proxy_ip" via "$default_gw" dev "$default_if" metric 5 2>/dev/null || true
         fi
 
         # 3. Create TUN interface with optimized MTU for mobile hotspot / VPN encapsulation
@@ -245,8 +256,8 @@ case "$1" in
         sleep 0.5
 
         # 5. Route all IPv4 traffic through the TUN interface
-        ip route add 0.0.0.0/1 dev "${TUN_NAME}" metric 10
-        ip route add 128.0.0.0/1 dev "${TUN_NAME}" metric 10
+        ip route replace 0.0.0.0/1 dev "${TUN_NAME}" metric 10
+        ip route replace 128.0.0.0/1 dev "${TUN_NAME}" metric 10
 
         # 6. Propagate environment variables into user systemd session
         sudo -u "$TARGET_USER" systemctl --user set-environment http_proxy="$proxy_arg" https_proxy="$proxy_arg" all_proxy="$proxy_arg" 2>/dev/null || true
@@ -269,9 +280,14 @@ case "$1" in
         if [ -f "$STATE_FILE" ]; then
             prev_proxy=$(cat "$STATE_FILE")
             prev_ip=$(echo "$prev_proxy" | sed -E 's|.*://([^:/]+).*|\1|')
-            def_line=$(ip -4 route show default | head -n 1)
+            def_line=$(ip -4 route show default | grep -E "dev (wl|en|eth|wlan|lan)" | head -n 1)
+            [ -z "$def_line" ] && def_line=$(ip -4 route show | grep -E "dev (wl|en|eth|wlan|lan)" | grep -E "via|default" | head -n 1)
+            [ -z "$def_line" ] && def_line=$(ip -4 route show default | head -n 1)
             default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
             default_gw=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
+            if [ -z "$default_gw" ] && [ -n "$default_if" ]; then
+                default_gw=$(ip -4 route show dev "$default_if" 2>/dev/null | awk '/default via/ {print $3}' | head -n 1)
+            fi
             if [ -n "$default_gw" ] && [ -n "$default_if" ] && [ -n "$prev_ip" ]; then
                 ip route del "$prev_ip" via "$default_gw" dev "$default_if" metric 5 2>/dev/null || true
             fi

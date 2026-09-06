@@ -20,6 +20,10 @@ class NetSpeedButton extends PanelMenu.Button {
         this._guiBin = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'netpulse-gui']);
         this._monBin = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'netpulse-monitor']);
 
+        this._updatingSwitch = false;
+        this._userToggledAt = 0;
+        this._targetState = false;
+
         // Panel Bar Layout: [NetPulse Icon] [Speed Label]
         const box = new St.BoxLayout({
             style_class: 'panel-status-menu-box',
@@ -74,6 +78,10 @@ class NetSpeedButton extends PanelMenu.Button {
         // 3. Proxy & TUN Control
         this._proxySwitch = new PopupMenu.PopupSwitchMenuItem(_('⚡ Forcer le Proxy (Mode TUN)'), false);
         this._proxySwitch.connect('toggled', (item, state) => {
+            if (this._updatingSwitch)
+                return;
+            this._userToggledAt = Date.now();
+            this._targetState = state;
             const action = state ? 'start' : 'stop';
             GLib.spawn_command_line_async(`${this._ctlBin} ${action}`);
         });
@@ -147,8 +155,24 @@ class NetSpeedButton extends PanelMenu.Button {
 
                     if ('proxy_active' in data) {
                         const isActive = !!data.proxy_active;
-                        if (this._proxySwitch.state !== isActive) {
-                            this._proxySwitch.setToggleState(isActive);
+                        const elapsed = Date.now() - (this._userToggledAt || 0);
+
+                        let shouldUpdate = true;
+                        if (elapsed < 6000) {
+                            if (isActive === this._targetState) {
+                                this._userToggledAt = 0;
+                            } else {
+                                shouldUpdate = false;
+                            }
+                        }
+
+                        if (shouldUpdate && this._proxySwitch.state !== isActive) {
+                            this._updatingSwitch = true;
+                            try {
+                                this._proxySwitch.setToggleState(isActive);
+                            } finally {
+                                this._updatingSwitch = false;
+                            }
                         }
                     }
                 }
