@@ -37,7 +37,36 @@ GLib.set_application_name("NetPulse")
 
 CONFIG_PATH = os.path.expanduser("~/.config/force-proxy/config.json")
 BLOCKED_FILE = os.path.expanduser("~/.config/force-proxy/blocked_apps.txt")
+SPLIT_APPS_FILE = os.path.expanduser("~/.config/force-proxy/split_apps.txt")
 STATS_PATH = "/tmp/netpulse_stats.json"
+
+
+def resolve_icon(name):
+    lower = name.lower()
+    if "chrome" in lower:
+        return "google-chrome"
+    elif "edge" in lower or "msedge" in lower:
+        return "microsoft-edge"
+    elif "firefox" in lower:
+        return "firefox"
+    elif "telegram" in lower:
+        return "org.telegram.desktop"
+    elif "steam" in lower:
+        return "steam"
+    elif "antigravity" in lower:
+        return "antigravity-ide"
+    elif "code" in lower or "vscode" in lower:
+        return "code"
+    elif "snap-store" in lower or "app-center" in lower:
+        return "snap-store"
+    elif "vlc" in lower:
+        return "vlc"
+    elif "python" in lower:
+        return "text-x-python"
+    elif "bash" in lower or "sh" in lower or "ptyxis" in lower:
+        return "utilities-terminal"
+    else:
+        return "application-x-executable"
 
 
 def load_config():
@@ -47,7 +76,8 @@ def load_config():
         "show_download": True,
         "show_upload": True,
         "show_session_total": True,
-        "autostart": True
+        "autostart": True,
+        "split_tunnel_mode": "disabled"
     }
     try:
         if os.path.exists(CONFIG_PATH):
@@ -190,6 +220,12 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self.row_widgets = {}  # pid -> dict of widgets
         self.empty_row = None
 
+        # Split Tunneling State
+        self.split_mode = self.config.get("split_tunnel_mode", "disabled")
+        self.split_apps = self._load_split_apps()
+        self.updating_split_ui = False
+        self.split_app_widgets = {}
+
         self._build_ui()
         self._load_gsettings()
         self._refresh_tun_status()
@@ -199,6 +235,15 @@ class NetPulseWindow(Adw.ApplicationWindow):
 
         # Polling timer for UI updates
         GLib.timeout_add_seconds(1, self._poll_stats)
+
+    def _load_split_apps(self):
+        try:
+            if os.path.exists(SPLIT_APPS_FILE):
+                with open(SPLIT_APPS_FILE, "r", encoding="utf-8") as f:
+                    return [line.strip().lower() for line in f if line.strip()]
+        except Exception:
+            pass
+        return []
 
     def _ensure_monitor_running(self):
         if not os.path.exists("/tmp/netpulse_monitor.pid"):
@@ -458,6 +503,19 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 w["up_lbl"].set_label(f"↑ {p['tx_speed_formatted']}")
                 w["up_lbl"].set_css_classes(["caption", "accent" if p["tx_speed"] > 1024 else "dim-label"])
 
+                route_badge = w.get("route_badge")
+                if route_badge:
+                    is_proxy_route = p.get("routing") == "proxy"
+                    route_badge.set_label("⚡ Proxy" if is_proxy_route else "🌐 Direct")
+                    route_badge.set_css_classes(["caption", "success" if is_proxy_route else "accent", "heading"])
+                    route_badge.set_tooltip_text("Routage actif : Proxy TUN" if is_proxy_route else "Routage actif : Connexion Directe")
+
+                btn_split = w.get("btn_split")
+                if btn_split:
+                    in_split = p.get("is_in_split", False)
+                    btn_split.set_css_classes(["suggested-action"] if in_split else ["flat"])
+                    btn_split.set_tooltip_text(f"« {pname} » est dans le Split Tunneling. Cliquer pour retirer." if in_split else f"Cliquer pour ajouter « {pname} » au Split Tunneling.")
+
                 btn_block = w["btn_block"]
                 if is_blocked:
                     btn_block.set_label("Bloqué")
@@ -493,8 +551,22 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 img.set_pixel_size(28)
                 expander.add_prefix(img)
 
-                suffix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                suffix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 suffix_box.set_valign(Gtk.Align.CENTER)
+
+                is_proxy_route = p.get("routing") == "proxy"
+                route_badge = Gtk.Label(label="⚡ Proxy" if is_proxy_route else "🌐 Direct")
+                route_badge.set_css_classes(["caption", "success" if is_proxy_route else "accent", "heading"])
+                route_badge.set_tooltip_text("Routage actif : Proxy TUN" if is_proxy_route else "Routage actif : Connexion Directe")
+                suffix_box.append(route_badge)
+
+                in_split = p.get("is_in_split", False)
+                btn_split = Gtk.Button.new_from_icon_name("network-workgroup-symbolic")
+                btn_split.set_valign(Gtk.Align.CENTER)
+                btn_split.set_css_classes(["suggested-action"] if in_split else ["flat"])
+                btn_split.set_tooltip_text(f"« {pname} » est dans le Split Tunneling. Cliquer pour retirer." if in_split else f"Cliquer pour ajouter « {pname} » au Split Tunneling.")
+                btn_split.connect("clicked", lambda b, pn=pname: self._on_toggle_process_split(pn))
+                suffix_box.append(btn_split)
 
                 rate_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
                 rate_box.set_valign(Gtk.Align.CENTER)
@@ -531,9 +603,18 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     "row": expander,
                     "down_lbl": down_lbl,
                     "up_lbl": up_lbl,
+                    "route_badge": route_badge,
+                    "btn_split": btn_split,
                     "btn_block": btn_block,
                     "sub_rows": sub_rows
                 }
+
+    def _on_toggle_process_split(self, app_name):
+        app_name = app_name.strip().lower()
+        if app_name in self.split_apps:
+            self._del_split_app(app_name)
+        else:
+            self._add_split_app(app_name)
 
     def _build_socket_subrows(self, expander, conns):
         sub_rows = []
@@ -630,7 +711,55 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self.tun_status_row.add_suffix(self.tun_badge)
         group_force.add(self.tun_status_row)
 
-        # Groupe 2 : Paramètres Proxy GNOME
+        # Groupe 2 : Routage Sélectif (Split Tunneling)
+        group_split = Adw.PreferencesGroup()
+        group_split.set_title("Routage Sélectif (Split Tunneling)")
+        group_split.set_description(
+            "Triez les applications à forcer via le serveur proxy TUN de celles qui utiliseront votre connexion directe."
+        )
+        page.add(group_split)
+
+        self.split_mode_combo = Adw.ComboRow()
+        self.split_mode_combo.set_title("Mode de routage des applications")
+        mode_model = Gtk.StringList()
+        mode_model.append("Désactivé (Tout le PC via le proxy TUN)")
+        mode_model.append("Inclusif : Forcer uniquement la sélection (Whitelist)")
+        mode_model.append("Exclusif : Tout router SAUF la sélection (Bypass)")
+        self.split_mode_combo.set_model(mode_model)
+
+        mode_idx = 0
+        if self.split_mode == "include":
+            mode_idx = 1
+        elif self.split_mode == "exclude":
+            mode_idx = 2
+        self.split_mode_combo.set_selected(mode_idx)
+        self.split_mode_combo.connect("notify::selected", self._on_split_mode_combo_changed)
+        group_split.add(self.split_mode_combo)
+
+        self.split_info_row = Adw.ActionRow()
+        self.split_info_row.set_title("Comportement actif")
+        group_split.add(self.split_info_row)
+
+        self.split_entry = Adw.EntryRow()
+        self.split_entry.set_title("Ajouter une application")
+        self.split_entry.props.show_apply_button = False
+
+        add_btn = Gtk.Button(label="Ajouter")
+        add_btn.set_valign(Gtk.Align.CENTER)
+        add_btn.add_css_class("suggested-action")
+        add_btn.connect("clicked", self._on_add_split_app_clicked)
+        self.split_entry.add_suffix(add_btn)
+        self.split_entry.connect("entry-activated", lambda e: self._on_add_split_app_clicked(None))
+        group_split.add(self.split_entry)
+
+        self.split_apps_group = Adw.PreferencesGroup()
+        self.split_apps_group.set_title("Applications filtrées")
+        page.add(self.split_apps_group)
+
+        self._update_split_info_subtitle()
+        self._render_split_apps_list()
+
+        # Groupe 3 : Paramètres Proxy GNOME
         group_proxy = Adw.PreferencesGroup()
         group_proxy.set_title("Configuration du serveur mandataire")
         page.add(group_proxy)
@@ -691,6 +820,160 @@ class NetPulseWindow(Adw.ApplicationWindow):
             "Serveur Mandataire",
             "network-vpn-symbolic"
         )
+
+    def _update_split_info_subtitle(self):
+        cnt = len(self.split_apps)
+        if self.split_mode == "include":
+            self.split_info_row.set_subtitle(
+                f"Mode Inclusif : Seules les {cnt} application(s) configurée(s) transitent par le proxy. Tout le reste du PC utilise la connexion directe."
+            )
+        elif self.split_mode == "exclude":
+            self.split_info_row.set_subtitle(
+                f"Mode Exclusif : Tout le PC transite par le proxy, SAUF les {cnt} application(s) configurée(s) qui utilisent la connexion directe."
+            )
+        else:
+            self.split_info_row.set_subtitle(
+                "Désactivé : 100% des connexions de l'ordinateur transitent par le proxy TUN."
+            )
+
+    def _on_split_mode_combo_changed(self, row, param):
+        if self.updating_split_ui:
+            return
+        idx = self.split_mode_combo.get_selected()
+        modes = ["disabled", "include", "exclude"]
+        new_mode = modes[idx] if idx < len(modes) else "disabled"
+        if new_mode == self.split_mode:
+            return
+        self.split_mode = new_mode
+        self.config["split_tunnel_mode"] = new_mode
+        save_config(self.config)
+        self._update_split_info_subtitle()
+        self._render_split_apps_list()
+
+        def worker():
+            env = os.environ.copy()
+            env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
+            subprocess.run([self.ctl_bin, "split-mode", new_mode], env=env, check=False)
+            def on_done():
+                mode_names = {
+                    "disabled": "Désactivé (Global)",
+                    "include": "Inclusif (Whitelist)",
+                    "exclude": "Exclusif (Bypass)"
+                }
+                toast = Adw.Toast.new(f"Mode Split Tunneling : {mode_names.get(new_mode, new_mode)}")
+                self.toast_overlay.add_toast(toast)
+                self._refresh_tun_status()
+                self._poll_stats()
+            GLib.idle_add(on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_add_split_app_clicked(self, btn):
+        text = self.split_entry.get_text().strip().lower()
+        if not text:
+            return
+        self.split_entry.set_text("")
+        self._add_split_app(text)
+
+    def _add_split_app(self, app_name):
+        app_name = app_name.strip().lower()
+        if not app_name:
+            return
+        if app_name in self.split_apps:
+            toast = Adw.Toast.new(f"« {app_name} » est déjà dans la liste de split tunneling.")
+            self.toast_overlay.add_toast(toast)
+            return
+
+        self.split_apps.append(app_name)
+        self._update_split_info_subtitle()
+        self._render_split_apps_list()
+
+        def worker():
+            env = os.environ.copy()
+            env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
+            subprocess.run([self.ctl_bin, "split-add", app_name], env=env, check=False)
+            def on_done():
+                toast = Adw.Toast.new(f"Application « {app_name} » ajoutée au Split Tunneling.")
+                self.toast_overlay.add_toast(toast)
+                self._poll_stats()
+            GLib.idle_add(on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _del_split_app(self, app_name):
+        app_name = app_name.strip().lower()
+        if app_name in self.split_apps:
+            self.split_apps.remove(app_name)
+        self._update_split_info_subtitle()
+        self._render_split_apps_list()
+
+        def worker():
+            env = os.environ.copy()
+            env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
+            subprocess.run([self.ctl_bin, "split-del", app_name], env=env, check=False)
+            def on_done():
+                toast = Adw.Toast.new(f"Application « {app_name} » retirée du Split Tunneling.")
+                self.toast_overlay.add_toast(toast)
+                self._poll_stats()
+            GLib.idle_add(on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _render_split_apps_list(self):
+        for app, row in list(self.split_app_widgets.items()):
+            self.split_apps_group.remove(row)
+        self.split_app_widgets.clear()
+
+        if hasattr(self, "split_empty_row") and self.split_empty_row:
+            try:
+                self.split_apps_group.remove(self.split_empty_row)
+            except Exception:
+                pass
+            self.split_empty_row = None
+
+        if not self.split_apps:
+            self.split_empty_row = Adw.ActionRow()
+            self.split_empty_row.set_title("Aucune application configurée")
+            self.split_empty_row.set_subtitle("Ajoutez des applications ci-dessus ou depuis l'onglet Trafic pour filtrer le routage.")
+            self.split_apps_group.add(self.split_empty_row)
+            return
+
+        for app in self.split_apps:
+            row = Adw.ActionRow()
+            row.set_title(app)
+
+            img = Gtk.Image.new_from_icon_name(resolve_icon(app))
+            img.set_pixel_size(24)
+            row.add_prefix(img)
+
+            suffix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            suffix_box.set_valign(Gtk.Align.CENTER)
+
+            badge = Gtk.Label()
+            if self.split_mode == "include":
+                badge.set_label("⚡ Proxy")
+                badge.set_css_classes(["caption", "success", "heading"])
+                row.set_subtitle("Forcée via le serveur proxy TUN")
+            elif self.split_mode == "exclude":
+                badge.set_label("🌐 Direct")
+                badge.set_css_classes(["caption", "accent", "heading"])
+                row.set_subtitle("Exclue du proxy (Connexion directe)")
+            else:
+                badge.set_label("Inactif")
+                badge.set_css_classes(["caption", "dim-label"])
+                row.set_subtitle("Split Tunneling désactivé")
+            suffix_box.append(badge)
+
+            del_btn = Gtk.Button.new_from_icon_name("user-trash-symbolic")
+            del_btn.set_valign(Gtk.Align.CENTER)
+            del_btn.add_css_class("flat")
+            del_btn.set_tooltip_text(f"Retirer « {app} » du Split Tunneling")
+            del_btn.connect("clicked", lambda b, a=app: self._del_split_app(a))
+            suffix_box.append(del_btn)
+
+            row.add_suffix(suffix_box)
+            self.split_apps_group.add(row)
+            self.split_app_widgets[app] = row
 
     # -----------------------------------------------------------------
     # ONGLET 3 : PARAMÈTRES DE L'INDICATEUR (SPEED METER)
@@ -804,6 +1087,24 @@ class NetPulseWindow(Adw.ApplicationWindow):
 
                 self.current_processes = data.get("processes", [])
                 self._render_process_list()
+
+                # Sync Split Tunneling state from daemon
+                sp_mode = data.get("split_tunnel_mode", "disabled")
+                sp_apps = data.get("split_apps", [])
+                if sp_mode != self.split_mode or sp_apps != self.split_apps:
+                    self.split_mode = sp_mode
+                    self.split_apps = sp_apps
+                    self.updating_split_ui = True
+                    idx = 0
+                    if sp_mode == "include":
+                        idx = 1
+                    elif sp_mode == "exclude":
+                        idx = 2
+                    if hasattr(self, "split_mode_combo") and self.split_mode_combo.get_selected() != idx:
+                        self.split_mode_combo.set_selected(idx)
+                    self.updating_split_ui = False
+                    self._update_split_info_subtitle()
+                    self._render_split_apps_list()
             except Exception:
                 pass
 
@@ -929,9 +1230,18 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     self.force_switch_row.set_active(is_active)
                     self.updating_switch = False
 
+                sp_mode = data.get("split_mode", self.split_mode)
                 if is_active:
-                    self.tun_status_row.set_subtitle(f"Toutes les applications sont routées vers {proxy_target}")
-                    self.tun_badge.set_label("Actif (TUN)")
+                    cnt = len(self.split_apps)
+                    if sp_mode == "include":
+                        self.tun_status_row.set_subtitle(f"Mode Inclusif : {cnt} application(s) routée(s) vers {proxy_target}")
+                        self.tun_badge.set_label("Inclusif (TUN)")
+                    elif sp_mode == "exclude":
+                        self.tun_status_row.set_subtitle(f"Mode Exclusif : Tout vers {proxy_target}, sauf {cnt} application(s)")
+                        self.tun_badge.set_label("Exclusif (TUN)")
+                    else:
+                        self.tun_status_row.set_subtitle(f"Toutes les applications sont routées vers {proxy_target}")
+                        self.tun_badge.set_label("Global (TUN)")
                     self.tun_badge.set_css_classes(["success", "heading"])
                 else:
                     self.tun_status_row.set_subtitle("Le trafic réseau emprunte le chemin normal (par application)")

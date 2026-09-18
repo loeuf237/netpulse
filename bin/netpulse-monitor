@@ -42,6 +42,7 @@ GLib.set_application_name("NetPulse Monitor")
 CONFIG_DIR = os.path.expanduser("~/.config/force-proxy")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 BLOCKED_FILE = os.path.join(CONFIG_DIR, "blocked_apps.txt")
+SPLIT_APPS_FILE = os.path.join(CONFIG_DIR, "split_apps.txt")
 STATS_PATH = "/tmp/netpulse_stats.json"
 RESET_FLAG_PATH = "/tmp/netpulse_reset_flag"
 PID_FILE = "/tmp/netpulse_monitor.pid"
@@ -131,6 +132,27 @@ def load_blocked_apps():
     except Exception:
         pass
     return set()
+
+
+def load_split_apps():
+    try:
+        if os.path.exists(SPLIT_APPS_FILE):
+            with open(SPLIT_APPS_FILE, "r", encoding="utf-8") as f:
+                return set(line.strip().lower() for line in f if line.strip())
+    except Exception:
+        pass
+    return set()
+
+
+def is_app_in_split_list(pname, cmdline, split_apps):
+    if not split_apps:
+        return False
+    p_low = pname.lower()
+    cmd_low = cmdline.lower() if cmdline else ""
+    for app in split_apps:
+        if app in p_low or p_low in app or app in cmd_low:
+            return True
+    return False
 
 
 def format_bytes(b, unit_mode="auto"):
@@ -617,6 +639,25 @@ class NetPulseEngine:
         except Exception:
             pass
 
+        # Split Tunneling state & cgroups
+        split_apps = load_split_apps()
+        split_mode = self.config.get("split_tunnel_mode", "disabled")
+        cgroup_proxy_pids = set()
+        try:
+            if os.path.exists("/sys/fs/cgroup/net_proxy/cgroup.procs"):
+                with open("/sys/fs/cgroup/net_proxy/cgroup.procs", "r") as f:
+                    cgroup_proxy_pids = set(int(line.strip()) for line in f if line.strip())
+        except Exception:
+            pass
+
+        cgroup_direct_pids = set()
+        try:
+            if os.path.exists("/sys/fs/cgroup/net_direct/cgroup.procs"):
+                with open("/sys/fs/cgroup/net_direct/cgroup.procs", "r") as f:
+                    cgroup_direct_pids = set(int(line.strip()) for line in f if line.strip())
+        except Exception:
+            pass
+
         for pid, c_list in grouped_conns.items():
             try:
                 proc = psutil.Process(pid)
@@ -626,6 +667,30 @@ class NetPulseEngine:
                 is_app_blocked = (pname.lower() in blocked_apps) or (pid in cgroup_blocked_pids)
                 if pname.lower() in blocked_apps and pid not in cgroup_blocked_pids:
                     subprocess.Popen([CTL_BIN, "block", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # Split Tunneling routing determination
+                is_in_split = is_app_in_split_list(pname, cmdline, split_apps)
+                if self.proxy_active:
+                    if split_mode == "include":
+                        if is_in_split:
+                            if pid not in cgroup_proxy_pids:
+                                subprocess.Popen([CTL_BIN, "split-assign", str(pid), "proxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                cgroup_proxy_pids.add(pid)
+                            route_mode = "proxy"
+                        else:
+                            route_mode = "direct"
+                    elif split_mode == "exclude":
+                        if is_in_split:
+                            if pid not in cgroup_direct_pids:
+                                subprocess.Popen([CTL_BIN, "split-assign", str(pid), "direct"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                cgroup_direct_pids.add(pid)
+                            route_mode = "direct"
+                        else:
+                            route_mode = "proxy"
+                    else:  # disabled
+                        route_mode = "proxy"
+                else:
+                    route_mode = "direct"
 
                 prate = proc_live_rates.get(pid, {'rx_speed': 0.0, 'tx_speed': 0.0, 'tot_rx': 0, 'tot_tx': 0})
                 p_rx_speed = prate['rx_speed']
@@ -677,6 +742,8 @@ class NetPulseEngine:
                     "cmdline": cmdline,
                     "icon": resolve_icon(pname),
                     "is_blocked": is_app_blocked,
+                    "routing": route_mode,
+                    "is_in_split": is_in_split,
                     "status": status_text,
                     "connections_count": len(c_list),
                     "rx_speed": p_rx_speed,
@@ -702,6 +769,10 @@ class NetPulseEngine:
             "session_start": self.session_start,
             "session_duration_sec": session_duration,
             "proxy_active": self.proxy_active,
+            "split_tunnel_mode": split_mode,
+            "split_apps": sorted(list(split_apps)),
+            "proxy_pids_count": len(cgroup_proxy_pids),
+            "direct_pids_count": len(cgroup_direct_pids),
             "rx_speed": rx_speed,
             "tx_speed": tx_speed,
             "rx_speed_formatted": self.cur_rx_formatted,

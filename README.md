@@ -36,7 +36,20 @@ Conçu avec les technologies les plus récentes de l'écosystème Linux (**GTK4*
 - Redirige toutes les applications qui ignorent habituellement les proxys GNOME standards (commandes terminal `curl`/`wget`, paquets Snap, jeux, daemons système).
 - Prévention native des boucles de routage vers la passerelle physique.
 
-### 5. 📟 Indicateur de vitesse dans la barre supérieure (Speed Meter)
+### 5. 🔀 Routage sélectif par application (Split Tunneling Avancé)
+- **Triage intelligent du trafic** : choisissez au cas par cas quelles applications transitent par le proxy et lesquelles utilisent votre connexion internet directe.
+- **3 Modes de routage instantanés (sans interruption de session)** :
+  - **Mode Global (Désactivé)** : 100 % du trafic du PC transite par le proxy TUN.
+  - **Mode Inclusif (Whitelist)** : Seules les applications sélectionnées (ex: `telegram`, `chrome`, `steam`) sont forcées via le proxy TUN. Tout le reste du système emprunte la connexion directe normale.
+  - **Mode Exclusif (Bypass / Blacklist)** : Tout le PC transite par le proxy TUN, **sauf** les applications sélectionnées qui contournent le proxy et accèdent directement à internet.
+- **Gestion hybride GUI & CLI** :
+  - Badges visuels en temps réel (`⚡ Proxy` / `🌐 Direct`) sur chaque ligne de processus dans l'onglet Trafic.
+  - Bouton 1-clic pour ajouter/retirer une application active du Split Tunneling.
+  - Gestionnaire de liste dédié dans l'onglet Serveur Mandataire.
+  - Commandes CLI `netpulse-ctl split-*`.
+- **Routage noyau haute performance** : basé sur `cgroups v2` (`net_proxy`, `net_direct`), marquage de paquets `iptables mangle` (`fwmark 0x1000` / `0x2000`) et tables de routage multiples Linux policy routing (`table 100` et `table 200`).
+
+### 6. 📟 Indicateur de vitesse dans la barre supérieure (Speed Meter)
 - Affichage direct du débit en temps réel dans le panneau supérieur de GNOME (`↓ 1.2 Mo/s  ↑ 250 Ko/s`).
 - Menu déroulant contextuel :
   - Débits instantanés.
@@ -199,6 +212,32 @@ netpulse-ctl stop
 
 # Basculer l'état
 netpulse-ctl toggle
+```
+
+#### Routage sélectif (Split Tunneling)
+```bash
+# Afficher l'état du Split Tunneling, mode actif et processus assignés
+netpulse-ctl split-status
+netpulse-ctl split-status --json
+
+# Définir le mode de routage (disabled, include, exclude)
+netpulse-ctl split-mode include     # Seules les applications listées vont au proxy
+netpulse-ctl split-mode exclude     # Tout va au proxy SAUF les applications listées
+netpulse-ctl split-mode disabled    # Mode global (tout le PC via le proxy)
+
+# Ajouter une application à la liste de tri
+netpulse-ctl split-add telegram
+netpulse-ctl split-add steam
+netpulse-ctl split-add chrome
+
+# Retirer une application de la liste
+netpulse-ctl split-del chrome
+
+# Lister les applications actuellement configurées
+netpulse-ctl split-list
+
+# Resynchroniser immédiatement tous les processus actifs
+netpulse-ctl split-sync
 ```
 
 #### Raccourcis généraux

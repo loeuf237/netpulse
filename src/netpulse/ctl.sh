@@ -9,6 +9,13 @@ TARGET_USER="paulin"
 TUN2SOCKS_BIN="/home/paulin/.local/bin/tun2socks"
 REAL_SCRIPT="$(readlink -f "$0")"
 
+SPLIT_DIR="/home/$TARGET_USER/.config/force-proxy"
+SPLIT_FILE="$SPLIT_DIR/split_apps.txt"
+CONFIG_FILE="$SPLIT_DIR/config.json"
+CGROUP_PROXY="/sys/fs/cgroup/net_proxy"
+CGROUP_DIRECT="/sys/fs/cgroup/net_direct"
+CGROUP_BLOCKED="/sys/fs/cgroup/net_blocked"
+
 # Quick check command for sudo validation
 if [ "$1" = "check-sudo" ]; then
     exit 0
@@ -32,6 +39,15 @@ Gestion du Forçage Proxy (Mode TUN) :
   stop                     Désactiver le forçage TUN et rétablir la connexion normale
   toggle [proxy_url]       Basculer l'état du forçage TUN (démarrer / arrêter)
 
+Routage Sélectif (Split Tunneling) :
+  split-status [--json]    Afficher l'état du split tunneling et les applications actives
+  split-mode [mode]        Définir ou afficher le mode : disabled, include, exclude
+  split-add <nom>          Ajouter une application à la liste (ex: telegram, steam, chrome)
+  split-del <nom>          Retirer une application de la liste
+  split-list               Lister toutes les applications configurées
+  split-assign <pid> <dst> Assigner un PID vers un routage (proxy, direct, default)
+  split-sync               Synchroniser tous les processus actifs selon le mode
+
 Pare-feu Applicatif (GlassWire Killswitch) :
   block-app <nom>          Bloquer tout accès réseau pour une application (ex: steam, chrome)
   unblock-app <nom>        Débloquer une application et rétablir son accès internet
@@ -48,18 +64,46 @@ Général :
 
 Exemples :
   $CMD_NAME status
-  $CMD_NAME start socks5://192.168.43.1:1180
-  $CMD_NAME block-app steam
-  $CMD_NAME unblock-app steam
+  $CMD_NAME split-mode include
+  $CMD_NAME split-add telegram
+  $CMD_NAME split-status
 EOF
 }
 
 get_status() {
     local running=1
-    if pgrep -f "tun2socks.*${TUN_NAME}" >/dev/null 2>&1 && ip link show "${TUN_NAME}" >/dev/null 2>&1 && ip route show 0.0.0.0/1 2>/dev/null | grep -q "${TUN_NAME}"; then
-        running=0
+    if pgrep -f "tun2socks.*${TUN_NAME}" >/dev/null 2>&1 && ip link show "${TUN_NAME}" >/dev/null 2>&1; then
+        if ip route show 0.0.0.0/1 2>/dev/null | grep -q "${TUN_NAME}" || ip route show table 100 2>/dev/null | grep -q "${TUN_NAME}"; then
+            running=0
+        fi
     fi
     return $running
+}
+
+read_split_mode() {
+    if [ -f "$CONFIG_FILE" ]; then
+        mode=$(grep -oP '"split_tunnel_mode"\s*:\s*"\K[^"]+' "$CONFIG_FILE" 2>/dev/null)
+        if [ -n "$mode" ]; then
+            echo "$mode"
+            return 0
+        fi
+    fi
+    echo "disabled"
+}
+
+save_split_mode() {
+    local new_mode="$1"
+    mkdir -p "$SPLIT_DIR"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "{ \"split_tunnel_mode\": \"$new_mode\" }" > "$CONFIG_FILE"
+    else
+        if grep -q '"split_tunnel_mode"' "$CONFIG_FILE" 2>/dev/null; then
+            sed -i -E "s/\"split_tunnel_mode\"\s*:\s*\"[^\"]*\"/\"split_tunnel_mode\": \"$new_mode\"/" "$CONFIG_FILE"
+        else
+            sed -i -E "s/(\s*)\}\s*$/,\n\1  \"split_tunnel_mode\": \"$new_mode\"\n}/" "$CONFIG_FILE"
+        fi
+    fi
+    chown "$TARGET_USER:$TARGET_USER" "$CONFIG_FILE" 2>/dev/null || true
 }
 
 # Commandes exécutables immédiatement sans droits root
@@ -86,6 +130,59 @@ case "$1" in
             "$REAL_SCRIPT" stop 2>/dev/null || true
         fi
         echo "NetPulse arrêté avec succès."
+        exit 0
+        ;;
+    split-list)
+        if [ -f "$SPLIT_FILE" ]; then
+            cat "$SPLIT_FILE"
+        fi
+        exit 0
+        ;;
+    split-mode)
+        if [ -z "$2" ]; then
+            read_split_mode
+            exit 0
+        fi
+        ;;
+    split-status)
+        mode=$(read_split_mode)
+        app_count=0
+        [ -f "$SPLIT_FILE" ] && app_count=$(grep -cv '^\s*$' "$SPLIT_FILE" 2>/dev/null || echo 0)
+        proxy_pids_count=0
+        [ -f "$CGROUP_PROXY/cgroup.procs" ] && proxy_pids_count=$(wc -l < "$CGROUP_PROXY/cgroup.procs" 2>/dev/null || echo 0)
+        direct_pids_count=0
+        [ -f "$CGROUP_DIRECT/cgroup.procs" ] && direct_pids_count=$(wc -l < "$CGROUP_DIRECT/cgroup.procs" 2>/dev/null || echo 0)
+
+        if [ "$2" = "--json" ]; then
+            apps_json="[]"
+            if [ -f "$SPLIT_FILE" ]; then
+                apps_json=$(python3 -c "import json; print(json.dumps([l.strip().lower() for l in open('$SPLIT_FILE') if l.strip()]))" 2>/dev/null || echo "[]")
+            fi
+            echo "{\"mode\": \"$mode\", \"apps_count\": $app_count, \"proxy_pids\": $proxy_pids_count, \"direct_pids\": $direct_pids_count, \"apps\": $apps_json}"
+            exit 0
+        fi
+
+        echo "--- État du Split Tunneling NetPulse ---"
+        echo "Mode actuel : $mode"
+        case "$mode" in
+            include)
+                echo "Comportement : Mode Inclusif (Seules les $app_count applications configurées transitent par le proxy TUN)"
+                ;;
+            exclude)
+                echo "Comportement : Mode Exclusif (Tout le PC transite par le proxy SAUF les $app_count applications configurées)"
+                ;;
+            disabled|*)
+                echo "Comportement : Désactivé (Tout le trafic de l'ordinateur transite par le proxy TUN)"
+                ;;
+        esac
+        echo "Processus routés vers Proxy (cgroup net_proxy) : $proxy_pids_count"
+        echo "Processus routés vers Direct (cgroup net_direct) : $direct_pids_count"
+        if [ -f "$SPLIT_FILE" ] && [ "$app_count" -gt 0 ]; then
+            echo "Applications enregistrées :"
+            sed 's/^/  - /' "$SPLIT_FILE"
+        else
+            echo "Aucune application enregistrée."
+        fi
         exit 0
         ;;
 esac
@@ -117,20 +214,21 @@ read_gnome_proxy() {
 # 1. STATUS: DOES NOT REQUIRE ROOT PRIVILEGES (NEVER CALL SUDO/PKEXEC)
 # -------------------------------------------------------------
 if [ "$1" = "status" ]; then
+    split_mode=$(read_split_mode)
     if [ "$2" = "--json" ]; then
         if get_status; then
             curr_proxy=$(cat "$STATE_FILE" 2>/dev/null || read_gnome_proxy)
-            echo "{\"active\": true, \"proxy\": \"$curr_proxy\", \"device\": \"$TUN_NAME\"}"
+            echo "{\"active\": true, \"proxy\": \"$curr_proxy\", \"device\": \"$TUN_NAME\", \"split_mode\": \"$split_mode\"}"
             exit 0
         else
             gnome_proxy=$(read_gnome_proxy)
-            echo "{\"active\": false, \"proxy\": \"$gnome_proxy\", \"device\": \"$TUN_NAME\"}"
+            echo "{\"active\": false, \"proxy\": \"$gnome_proxy\", \"device\": \"$TUN_NAME\", \"split_mode\": \"$split_mode\"}"
             exit 0
         fi
     else
         if get_status; then
             curr_proxy=$(cat "$STATE_FILE" 2>/dev/null || read_gnome_proxy)
-            echo "Proxy forcé actif sur ${TUN_NAME} -> ${curr_proxy}"
+            echo "Proxy forcé actif sur ${TUN_NAME} -> ${curr_proxy} (Split Tunneling: ${split_mode})"
             exit 0
         else
             echo "Proxy forcé inactif"
@@ -164,8 +262,183 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # -------------------------------------------------------------
-# 3. ACTIONS EXECUTED AS ROOT
+# 3. ACTIONS EXECUTED AS ROOT & SPLIT TUNNELING HELPERS
 # -------------------------------------------------------------
+
+get_net_info() {
+    def_line=$(ip -4 route show default | grep -E "dev (wl|en|eth|wlan|lan)" | head -n 1)
+    [ -z "$def_line" ] && def_line=$(ip -4 route show | grep -E "dev (wl|en|eth|wlan|lan)" | grep -E "via|default" | head -n 1)
+    [ -z "$def_line" ] && def_line=$(ip -4 route show default | head -n 1)
+
+    default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    default_gw=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
+    if [ -z "$default_gw" ] && [ -n "$default_if" ]; then
+        default_gw=$(ip -4 route show dev "$default_if" 2>/dev/null | awk '/default via/ {print $3}' | head -n 1)
+    fi
+}
+
+split_setup_rules() {
+    get_net_info
+    mkdir -p "$CGROUP_PROXY" "$CGROUP_DIRECT" "$CGROUP_BLOCKED"
+    chown -R "$TARGET_USER:$TARGET_USER" "$CGROUP_PROXY" "$CGROUP_DIRECT" "$CGROUP_BLOCKED" 2>/dev/null || true
+
+    # 1. iptables mangle OUTPUT marks
+    iptables -t mangle -C OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || \
+        iptables -t mangle -A OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000
+    iptables -t mangle -C OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || \
+        iptables -t mangle -A OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000
+
+    ip6tables -t mangle -C OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || \
+        ip6tables -t mangle -A OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || true
+    ip6tables -t mangle -C OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || \
+        ip6tables -t mangle -A OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || true
+
+    # 2. ip rule policy routing
+    ip rule add fwmark 0x1000/0x1000 table 100 priority 50 2>/dev/null || true
+    ip rule add fwmark 0x2000/0x2000 table 200 priority 50 2>/dev/null || true
+
+    # 3. routing table 100 -> proxy tun
+    ip route replace default dev "${TUN_NAME}" table 100 2>/dev/null || true
+
+    # 4. routing table 200 -> direct physical gateway
+    if [ -n "$default_gw" ] && [ -n "$default_if" ]; then
+        ip route replace default via "$default_gw" dev "$default_if" table 200 2>/dev/null || true
+    elif [ -n "$default_if" ]; then
+        ip route replace default dev "$default_if" table 200 2>/dev/null || true
+    fi
+}
+
+split_cleanup_rules() {
+    # Move processes out of cgroups
+    target_uid=$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)
+    for cg in "$CGROUP_PROXY" "$CGROUP_DIRECT"; do
+        if [ -f "$cg/cgroup.procs" ]; then
+            for p in $(cat "$cg/cgroup.procs" 2>/dev/null); do
+                echo "$p" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/app.slice/cgroup.procs" 2>/dev/null || \
+                echo "$p" > "/sys/fs/cgroup/cgroup.procs" 2>/dev/null || true
+            done
+        fi
+    done
+
+    # Remove iptables mangle rules
+    iptables -t mangle -D OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || true
+    ip6tables -t mangle -D OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || true
+    ip6tables -t mangle -D OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || true
+
+    # Remove routing rules & tables
+    ip rule del fwmark 0x1000/0x1000 table 100 priority 50 2>/dev/null || true
+    ip rule del fwmark 0x2000/0x2000 table 200 priority 50 2>/dev/null || true
+    ip route flush table 100 2>/dev/null || true
+    ip route flush table 200 2>/dev/null || true
+}
+
+split_assign_pid() {
+    local target_pid="$1"
+    local destination="$2" # proxy, direct, default
+    [ -z "$target_pid" ] || [ ! -d "/proc/$target_pid" ] && return 1
+
+    target_uid=$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)
+    case "$destination" in
+        proxy)
+            mkdir -p "$CGROUP_PROXY"
+            echo "$target_pid" > "$CGROUP_PROXY/cgroup.procs" 2>/dev/null || true
+            ;;
+        direct)
+            mkdir -p "$CGROUP_DIRECT"
+            echo "$target_pid" > "$CGROUP_DIRECT/cgroup.procs" 2>/dev/null || true
+            ;;
+        default)
+            echo "$target_pid" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/app.slice/cgroup.procs" 2>/dev/null || \
+            echo "$target_pid" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/cgroup.procs" 2>/dev/null || \
+            echo "$target_pid" > "/sys/fs/cgroup/cgroup.procs" 2>/dev/null || true
+            ;;
+    esac
+}
+
+split_sync() {
+    local mode
+    mode=$(read_split_mode)
+
+    # If mode is disabled, empty both cgroups
+    if [ "$mode" = "disabled" ]; then
+        for cg in "$CGROUP_PROXY" "$CGROUP_DIRECT"; do
+            if [ -f "$cg/cgroup.procs" ]; then
+                for p in $(cat "$cg/cgroup.procs" 2>/dev/null); do
+                    split_assign_pid "$p" "default"
+                done
+            fi
+        done
+        return 0
+    fi
+
+    # Read configured split apps
+    local apps=()
+    if [ -f "$SPLIT_FILE" ]; then
+        while IFS= read -r line; do
+            line=$(echo "$line" | tr -d '\r\n' | tr '[:upper:]' '[:lower:]' | xargs)
+            [ -n "$line" ] && apps+=("$line")
+        done < "$SPLIT_FILE"
+    fi
+
+    # If mode is include:
+    if [ "$mode" = "include" ]; then
+        # Empty net_direct
+        if [ -f "$CGROUP_DIRECT/cgroup.procs" ]; then
+            for p in $(cat "$CGROUP_DIRECT/cgroup.procs" 2>/dev/null); do
+                split_assign_pid "$p" "default"
+            done
+        fi
+        # Find all PIDs matching any split app and assign to proxy
+        for app in "${apps[@]}"; do
+            pids=$(pgrep -i "$app" 2>/dev/null || true)
+            for p in $pids; do
+                [ -d "/proc/$p" ] && split_assign_pid "$p" "proxy"
+            done
+        done
+    fi
+
+    # If mode is exclude:
+    if [ "$mode" = "exclude" ]; then
+        # Empty net_proxy
+        if [ -f "$CGROUP_PROXY/cgroup.procs" ]; then
+            for p in $(cat "$CGROUP_PROXY/cgroup.procs" 2>/dev/null); do
+                split_assign_pid "$p" "default"
+            done
+        fi
+        # Find all PIDs matching any split app and assign to direct
+        for app in "${apps[@]}"; do
+            pids=$(pgrep -i "$app" 2>/dev/null || true)
+            for p in $pids; do
+                [ -d "/proc/$p" ] && split_assign_pid "$p" "direct"
+            done
+        done
+    fi
+}
+
+split_set_mode() {
+    local new_mode="$1"
+    if [ "$new_mode" != "disabled" ] && [ "$new_mode" != "include" ] && [ "$new_mode" != "exclude" ]; then
+        echo "Erreur: Mode invalide '$new_mode'. Choix possibles : disabled, include, exclude" >&2
+        return 1
+    fi
+
+    save_split_mode "$new_mode"
+
+    if get_status; then
+        split_setup_rules
+        if [ "$new_mode" = "include" ]; then
+            ip route del 0.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
+            ip route del 128.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
+        else
+            ip route replace 0.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
+            ip route replace 128.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
+        fi
+        split_sync
+    fi
+    echo "Mode Split Tunneling défini sur : $new_mode"
+}
+
 case "$1" in
     start)
         proxy_arg="$2"
@@ -255,9 +528,19 @@ case "$1" in
         # Wait a moment for interface initialization
         sleep 0.5
 
-        # 5. Route all IPv4 traffic through the TUN interface
-        ip route replace 0.0.0.0/1 dev "${TUN_NAME}" metric 10
-        ip route replace 128.0.0.0/1 dev "${TUN_NAME}" metric 10
+        # 5. Route IPv4 traffic according to Split Tunneling mode
+        split_setup_rules
+        split_mode=$(read_split_mode)
+
+        if [ "$split_mode" != "include" ]; then
+            ip route replace 0.0.0.0/1 dev "${TUN_NAME}" metric 10
+            ip route replace 128.0.0.0/1 dev "${TUN_NAME}" metric 10
+        else
+            ip route del 0.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
+            ip route del 128.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
+        fi
+
+        split_sync
 
         # 6. Propagate environment variables into user systemd session
         sudo -u "$TARGET_USER" systemctl --user set-environment http_proxy="$proxy_arg" https_proxy="$proxy_arg" all_proxy="$proxy_arg" 2>/dev/null || true
@@ -269,12 +552,15 @@ case "$1" in
         fi
         pkill -f "/snap/snap-store" 2>/dev/null || true
 
-        echo "Succès: Tout le trafic du PC est désormais forcé vers $proxy_arg"
+        echo "Succès: Tout le trafic du PC est désormais forcé vers $proxy_arg (Split Tunneling: $split_mode)"
         exit 0
         ;;
 
     stop)
         echo "Désactivation du forçage proxy..."
+
+        # Clean up Split Tunneling rules, tables and cgroups
+        split_cleanup_rules
 
         # Read previous proxy IP to clean route
         if [ -f "$STATE_FILE" ]; then
@@ -485,6 +771,66 @@ case "$1" in
         echo "$TARGET_USER ALL=(ALL) NOPASSWD: /home/$TARGET_USER/.local/bin/netpulse-ctl, /home/$TARGET_USER/.local/bin/force-proxy-ctl" > /etc/sudoers.d/force-proxy
         chmod 440 /etc/sudoers.d/netpulse /etc/sudoers.d/force-proxy 2>/dev/null || true
         echo "Configuration sudoers mise à jour avec succès."
+        exit 0
+        ;;
+
+    split-mode)
+        new_mode="$2"
+        if [ -z "$new_mode" ]; then
+            read_split_mode
+            exit 0
+        fi
+        split_set_mode "$new_mode"
+        exit 0
+        ;;
+
+    split-add)
+        app_name="$2"
+        if [ -n "$app_name" ]; then
+            mkdir -p "$SPLIT_DIR"
+            touch "$SPLIT_FILE"
+            app_lower=$(echo "$app_name" | tr '[:upper:]' '[:lower:]' | xargs)
+            if ! grep -Fxq "$app_lower" "$SPLIT_FILE" 2>/dev/null; then
+                echo "$app_lower" >> "$SPLIT_FILE"
+            fi
+            chown -R "$TARGET_USER:$TARGET_USER" "$SPLIT_DIR" 2>/dev/null || true
+            split_sync
+            echo "Application '$app_lower' ajoutée au Split Tunneling."
+            exit 0
+        fi
+        echo "Usage: $CMD_NAME split-add <nom_application>" >&2
+        exit 1
+        ;;
+
+    split-del)
+        app_name="$2"
+        if [ -n "$app_name" ]; then
+            app_lower=$(echo "$app_name" | tr '[:upper:]' '[:lower:]' | xargs)
+            if [ -f "$SPLIT_FILE" ]; then
+                sed -i "/^$app_lower$/d" "$SPLIT_FILE" 2>/dev/null || true
+            fi
+            split_sync
+            echo "Application '$app_lower' retirée du Split Tunneling."
+            exit 0
+        fi
+        echo "Usage: $CMD_NAME split-del <nom_application>" >&2
+        exit 1
+        ;;
+
+    split-assign)
+        target_pid="$2"
+        target_dest="$3"
+        if [ -n "$target_pid" ] && [ -n "$target_dest" ]; then
+            split_assign_pid "$target_pid" "$target_dest"
+            exit 0
+        fi
+        echo "Usage: $CMD_NAME split-assign <pid> <proxy|direct|default>" >&2
+        exit 1
+        ;;
+
+    split-sync)
+        split_sync
+        echo "Synchronisation du Split Tunneling terminée."
         exit 0
         ;;
 
