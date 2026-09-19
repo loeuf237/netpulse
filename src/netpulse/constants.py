@@ -20,6 +20,23 @@ DEFAULT_CONFIG = {
     "show_upload": True,
     "show_session_total": True,
     "autostart": True,
-    "split_tunnel_mode": "disabled"
+    "split_tunnel_mode": "disabled",
+    "bypass_ftp": True
 }
+
+# Applications et protocoles FTP automatiquement exemptés du proxy TUN
+FTP_KNOWN_APPS = {
+    "filezilla",
+    "ftp",
+    "lftp",
+    "ncftp",
+    "gvfsd-ftp",
+    "kio_ftp",
+    "cyberduck",
+    "tftp",
+    "vsftpd",
+    "proftpd",
+    "pure-ftpd"
+}
+FTP_PORTS = {20, 21, 989, 990}
 

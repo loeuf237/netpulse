@@ -48,6 +48,10 @@ Routage Sélectif (Split Tunneling) :
   split-assign <pid> <dst> Assigner un PID vers un routage (proxy, direct, default)
   split-sync               Synchroniser tous les processus actifs selon le mode
 
+Contournement FTP (Protection des transferts de fichiers) :
+  ftp-status               Afficher l'état du contournement FTP et des règles de routage
+  ftp-bypass [on|off]      Activer ou désactiver l'exemption automatique du trafic FTP (actif par défaut)
+
 Pare-feu Applicatif (GlassWire Killswitch) :
   block-app <nom>          Bloquer tout accès réseau pour une application (ex: steam, chrome)
   unblock-app <nom>        Débloquer une application et rétablir son accès internet
@@ -101,6 +105,34 @@ save_split_mode() {
             sed -i -E "s/\"split_tunnel_mode\"\s*:\s*\"[^\"]*\"/\"split_tunnel_mode\": \"$new_mode\"/" "$CONFIG_FILE"
         else
             sed -i -E "s/(\s*)\}\s*$/,\n\1  \"split_tunnel_mode\": \"$new_mode\"\n}/" "$CONFIG_FILE"
+        fi
+    fi
+    chown "$TARGET_USER:$TARGET_USER" "$CONFIG_FILE" 2>/dev/null || true
+}
+
+read_bypass_ftp() {
+    if [ -f "$CONFIG_FILE" ]; then
+        val=$(grep -oP '"bypass_ftp"\s*:\s*\K(true|false)' "$CONFIG_FILE" 2>/dev/null)
+        if [ "$val" = "false" ]; then
+            echo "0"
+            return 0
+        fi
+    fi
+    echo "1" # Actif par défaut
+}
+
+save_bypass_ftp() {
+    local enabled="$1" # 1 ou 0
+    local bool_str="true"
+    [ "$enabled" = "0" ] || [ "$enabled" = "off" ] || [ "$enabled" = "false" ] && bool_str="false"
+    mkdir -p "$SPLIT_DIR"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "{ \"bypass_ftp\": $bool_str }" > "$CONFIG_FILE"
+    else
+        if grep -q '"bypass_ftp"' "$CONFIG_FILE" 2>/dev/null; then
+            sed -i -E "s/\"bypass_ftp\"\s*:\s*(true|false)/\"bypass_ftp\": $bool_str/" "$CONFIG_FILE"
+        else
+            sed -i -E "s/(\s*)\}\s*$/,\n\1  \"bypass_ftp\": $bool_str\n}/" "$CONFIG_FILE"
         fi
     fi
     chown "$TARGET_USER:$TARGET_USER" "$CONFIG_FILE" 2>/dev/null || true
@@ -215,26 +247,63 @@ read_gnome_proxy() {
 # -------------------------------------------------------------
 if [ "$1" = "status" ]; then
     split_mode=$(read_split_mode)
+    bypass_ftp=$(read_bypass_ftp)
+    ftp_desc="Désactivé"
+    [ "$bypass_ftp" = "1" ] && ftp_desc="Actif"
     if [ "$2" = "--json" ]; then
         if get_status; then
             curr_proxy=$(cat "$STATE_FILE" 2>/dev/null || read_gnome_proxy)
-            echo "{\"active\": true, \"proxy\": \"$curr_proxy\", \"device\": \"$TUN_NAME\", \"split_mode\": \"$split_mode\"}"
+            echo "{\"active\": true, \"proxy\": \"$curr_proxy\", \"device\": \"$TUN_NAME\", \"split_mode\": \"$split_mode\", \"bypass_ftp\": $([ "$bypass_ftp" = "1" ] && echo true || echo false)}"
             exit 0
         else
             gnome_proxy=$(read_gnome_proxy)
-            echo "{\"active\": false, \"proxy\": \"$gnome_proxy\", \"device\": \"$TUN_NAME\", \"split_mode\": \"$split_mode\"}"
+            echo "{\"active\": false, \"proxy\": \"$gnome_proxy\", \"device\": \"$TUN_NAME\", \"split_mode\": \"$split_mode\", \"bypass_ftp\": $([ "$bypass_ftp" = "1" ] && echo true || echo false)}"
             exit 0
         fi
     else
         if get_status; then
             curr_proxy=$(cat "$STATE_FILE" 2>/dev/null || read_gnome_proxy)
-            echo "Proxy forcé actif sur ${TUN_NAME} -> ${curr_proxy} (Split Tunneling: ${split_mode})"
+            echo "Proxy forcé actif sur ${TUN_NAME} -> ${curr_proxy} (Split Tunneling: ${split_mode}, Contournement FTP: ${ftp_desc})"
             exit 0
         else
-            echo "Proxy forcé inactif"
+            echo "Proxy forcé inactif (Contournement FTP: ${ftp_desc})"
             exit 0
         fi
     fi
+fi
+
+if [ "$1" = "ftp-status" ]; then
+    bypass_ftp=$(read_bypass_ftp)
+    rules_active="Non"
+    if ip rule show 2>/dev/null | grep -q "dport 21.*lookup 200"; then
+        rules_active="Oui"
+    fi
+    ct_loaded="Non"
+    if lsmod 2>/dev/null | grep -q "nf_conntrack_ftp"; then
+        ct_loaded="Oui"
+    fi
+    direct_pids=0
+    if [ -f "$CGROUP_DIRECT/cgroup.procs" ]; then
+        direct_pids=$(wc -l < "$CGROUP_DIRECT/cgroup.procs" 2>/dev/null || echo 0)
+    fi
+
+    if [ "$2" = "--json" ]; then
+        echo "{\"bypass_ftp\": $([ "$bypass_ftp" = "1" ] && echo true || echo false), \"routing_rules_active\": $([ "$rules_active" = "Oui" ] && echo true || echo false), \"conntrack_helper\": $([ "$ct_loaded" = "Oui" ] && echo true || echo false), \"direct_pids\": $direct_pids}"
+        exit 0
+    fi
+
+    echo "--- État du Contournement FTP NetPulse ---"
+    if [ "$bypass_ftp" = "1" ]; then
+        echo "Exemption FTP : Activée (Les flux FTP sont automatiquement acheminés hors du proxy)"
+    else
+        echo "Exemption FTP : Désactivée"
+    fi
+    echo "Règles de routage noyau actives : $rules_active"
+    echo "Module conntrack FTP chargé : $ct_loaded"
+    echo "Ports exemptés : 20 (données actives), 21 (contrôle FTP), 989/990 (FTPS), ports passifs dynamiques"
+    echo "Applications FTP surveillées : FileZilla, gvfsd-ftp (Nautilus), lftp, ncftp, ftp, cyberduck"
+    echo "Processus en mode direct (cgroup net_direct) : $direct_pids"
+    exit 0
 fi
 
 # -------------------------------------------------------------
@@ -266,14 +335,17 @@ fi
 # -------------------------------------------------------------
 
 get_net_info() {
-    def_line=$(ip -4 route show default | grep -E "dev (wl|en|eth|wlan|lan)" | head -n 1)
-    [ -z "$def_line" ] && def_line=$(ip -4 route show | grep -E "dev (wl|en|eth|wlan|lan)" | grep -E "via|default" | head -n 1)
-    [ -z "$def_line" ] && def_line=$(ip -4 route show default | head -n 1)
+    def_line=$(ip -4 route show default 2>/dev/null | grep -v "${TUN_NAME}" | head -n 1)
+    [ -z "$def_line" ] && def_line=$(ip -4 route show 2>/dev/null | grep -v "${TUN_NAME}" | grep -E "via|default" | head -n 1)
+    [ -z "$def_line" ] && def_line=$(ip -4 route show default 2>/dev/null | head -n 1)
 
     default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
     default_gw=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
     if [ -z "$default_gw" ] && [ -n "$default_if" ]; then
         default_gw=$(ip -4 route show dev "$default_if" 2>/dev/null | awk '/default via/ {print $3}' | head -n 1)
+    fi
+    if [ -n "$default_if" ]; then
+        default_ip=$(ip -4 addr show dev "$default_if" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
     fi
 }
 
@@ -300,11 +372,62 @@ split_setup_rules() {
     # 3. routing table 100 -> proxy tun
     ip route replace default dev "${TUN_NAME}" table 100 2>/dev/null || true
 
-    # 4. routing table 200 -> direct physical gateway
+    # 4. routing table 200 -> direct physical gateway & non-TUN routes
     if [ -n "$default_gw" ] && [ -n "$default_if" ]; then
-        ip route replace default via "$default_gw" dev "$default_if" table 200 2>/dev/null || true
+        if [ -n "$default_ip" ]; then
+            ip route replace default via "$default_gw" dev "$default_if" src "$default_ip" table 200 2>/dev/null || true
+        else
+            ip route replace default via "$default_gw" dev "$default_if" table 200 2>/dev/null || true
+        fi
     elif [ -n "$default_if" ]; then
         ip route replace default dev "$default_if" table 200 2>/dev/null || true
+    fi
+    # Copy existing subnets and direct routes to table 200 (LAN subnets, local interfaces)
+    ip -4 route show 2>/dev/null | grep -v "${TUN_NAME}" | grep -v "0.0.0.0/1" | grep -v "128.0.0.0/1" | while read -r r; do
+        ip route replace $r table 200 2>/dev/null || true
+    done
+
+    # 5. FTP Traffic Exemption (Bypass FTP)
+    if [ "$(read_bypass_ftp)" = "1" ]; then
+        # Load netfilter FTP conntrack helper
+        modprobe nf_conntrack_ftp 2>/dev/null || true
+
+        # Raw CT helper for FTP control traffic (ports 21, 990)
+        iptables -t raw -C OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || \
+            iptables -t raw -A OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
+        ip6tables -t raw -C OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || \
+            ip6tables -t raw -A OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
+
+        # Mangle FTP bypass rules: mark with 0x2000 (direct table 200)
+        iptables -t mangle -C OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000
+        iptables -t mangle -C OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000
+        iptables -t mangle -C OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000
+        iptables -t mangle -C OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-mark 0x2000
+
+        ip6tables -t mangle -C OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || \
+            ip6tables -t mangle -A OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+        ip6tables -t mangle -C OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || \
+            ip6tables -t mangle -A OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+        ip6tables -t mangle -C OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || \
+            ip6tables -t mangle -A OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+
+        # IP policy rules for FTP socket routing (priority 40, before priority 50)
+        ip rule add ipproto tcp dport 21 table 200 priority 40 2>/dev/null || true
+        ip rule add ipproto tcp dport 990 table 200 priority 40 2>/dev/null || true
+        ip rule add ipproto tcp dport 20 table 200 priority 40 2>/dev/null || true
+        ip rule add ipproto tcp sport 20 table 200 priority 40 2>/dev/null || true
+        ip rule add ipproto tcp dport 989 table 200 priority 40 2>/dev/null || true
+        ip rule add ipproto tcp sport 989 table 200 priority 40 2>/dev/null || true
+    fi
+
+    # 6. Masquerade on physical interface so rerouted direct packets have correct source IP
+    if [ -n "$default_if" ]; then
+        iptables -t nat -C POSTROUTING -o "$default_if" -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -A POSTROUTING -o "$default_if" -j MASQUERADE 2>/dev/null || true
     fi
 }
 
@@ -326,11 +449,37 @@ split_cleanup_rules() {
     ip6tables -t mangle -D OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || true
     ip6tables -t mangle -D OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || true
 
+    # Remove FTP bypass rules
+    iptables -t raw -D OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
+    ip6tables -t raw -D OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+
+    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+    ip6tables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+
+    # Remove FTP ip rules
+    ip rule del ipproto tcp dport 21 table 200 priority 40 2>/dev/null || true
+    ip rule del ipproto tcp dport 990 table 200 priority 40 2>/dev/null || true
+    ip rule del ipproto tcp dport 20 table 200 priority 40 2>/dev/null || true
+    ip rule del ipproto tcp sport 20 table 200 priority 40 2>/dev/null || true
+    ip rule del ipproto tcp dport 989 table 200 priority 40 2>/dev/null || true
+    ip rule del ipproto tcp sport 989 table 200 priority 40 2>/dev/null || true
+
     # Remove routing rules & tables
     ip rule del fwmark 0x1000/0x1000 table 100 priority 50 2>/dev/null || true
     ip rule del fwmark 0x2000/0x2000 table 200 priority 50 2>/dev/null || true
     ip route flush table 100 2>/dev/null || true
     ip route flush table 200 2>/dev/null || true
+
+    # Remove masquerade rule
+    get_net_info
+    if [ -n "$default_if" ]; then
+        iptables -t nat -D POSTROUTING -o "$default_if" -j MASQUERADE 2>/dev/null || true
+    fi
 }
 
 split_assign_pid() {
@@ -359,16 +508,39 @@ split_assign_pid() {
 split_sync() {
     local mode
     mode=$(read_split_mode)
+    local bypass_ftp
+    bypass_ftp=$(read_bypass_ftp)
 
-    # If mode is disabled, empty both cgroups
+    # Function to ensure FTP applications are routed direct
+    sync_ftp_apps() {
+        if [ "$bypass_ftp" = "1" ]; then
+            local ftp_apps=("filezilla" "lftp" "ftp" "ncftp" "gvfsd-ftp" "kio_ftp" "cyberduck" "tftp" "vsftpd" "proftpd" "pure-ftpd")
+            for fapp in "${ftp_apps[@]}"; do
+                local fpids
+                fpids=$(pgrep -i "$fapp" 2>/dev/null || true)
+                for p in $fpids; do
+                    [ -d "/proc/$p" ] && split_assign_pid "$p" "direct"
+                done
+            done
+        fi
+    }
+
+    # If mode is disabled, empty proxy cgroup, keep only FTP apps in direct cgroup
     if [ "$mode" = "disabled" ]; then
-        for cg in "$CGROUP_PROXY" "$CGROUP_DIRECT"; do
-            if [ -f "$cg/cgroup.procs" ]; then
-                for p in $(cat "$cg/cgroup.procs" 2>/dev/null); do
+        if [ -f "$CGROUP_PROXY/cgroup.procs" ]; then
+            for p in $(cat "$CGROUP_PROXY/cgroup.procs" 2>/dev/null); do
+                split_assign_pid "$p" "default"
+            done
+        fi
+        if [ "$bypass_ftp" != "1" ]; then
+            if [ -f "$CGROUP_DIRECT/cgroup.procs" ]; then
+                for p in $(cat "$CGROUP_DIRECT/cgroup.procs" 2>/dev/null); do
                     split_assign_pid "$p" "default"
                 done
             fi
-        done
+        else
+            sync_ftp_apps
+        fi
         return 0
     fi
 
@@ -396,6 +568,7 @@ split_sync() {
                 [ -d "/proc/$p" ] && split_assign_pid "$p" "proxy"
             done
         done
+        sync_ftp_apps
     fi
 
     # If mode is exclude:
@@ -413,6 +586,7 @@ split_sync() {
                 [ -d "/proc/$p" ] && split_assign_pid "$p" "direct"
             done
         done
+        sync_ftp_apps
     fi
 }
 
@@ -542,10 +716,10 @@ case "$1" in
 
         split_sync
 
-        # 6. Propagate environment variables into user systemd session
-        sudo -u "$TARGET_USER" systemctl --user set-environment http_proxy="$proxy_arg" https_proxy="$proxy_arg" all_proxy="$proxy_arg" 2>/dev/null || true
+        # 6. Propagate environment variables into user systemd session (HTTP/HTTPS only, NO all_proxy to preserve FTP!)
+        sudo -u "$TARGET_USER" systemctl --user set-environment http_proxy="$proxy_arg" https_proxy="$proxy_arg" 2>/dev/null || true
+        sudo -u "$TARGET_USER" systemctl --user unset-environment all_proxy ALL_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
 
-        
         # Configure snap daemon proxy if HTTP proxy is used
         if echo "$proxy_arg" | grep -qE '^https?://'; then
             snap set system proxy.http="$proxy_arg" proxy.https="$proxy_arg" 2>/dev/null || true
@@ -603,7 +777,7 @@ case "$1" in
         ip tuntap del dev "${TUN_NAME}" mode tun 2>/dev/null || true
 
         # Unset user environment
-        sudo -u "$TARGET_USER" systemctl --user unset-environment http_proxy https_proxy all_proxy 2>/dev/null || true
+        sudo -u "$TARGET_USER" systemctl --user unset-environment http_proxy https_proxy all_proxy ALL_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
 
         
         snap unset system proxy.http proxy.https 2>/dev/null || true
@@ -832,6 +1006,60 @@ case "$1" in
         split_sync
         echo "Synchronisation du Split Tunneling terminée."
         exit 0
+        ;;
+
+    ftp-bypass)
+        action="$2"
+        if [ -z "$action" ]; then
+            curr=$(read_bypass_ftp)
+            if [ "$curr" = "1" ]; then
+                echo "Contournement FTP actif (les transferts FTP contournent automatiquement le proxy)."
+            else
+                echo "Contournement FTP inactif."
+            fi
+            exit 0
+        fi
+        case "$action" in
+            on|enable|true|1)
+                save_bypass_ftp 1
+                if get_status; then
+                    split_setup_rules
+                    split_sync
+                fi
+                echo "Contournement FTP activé avec succès."
+                exit 0
+                ;;
+            off|disable|false|0)
+                save_bypass_ftp 0
+                if get_status; then
+                    # Retirer les règles spécifiques FTP
+                    iptables -t raw -D OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
+                    ip6tables -t raw -D OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+
+                    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+                    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
+                    ip6tables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+
+                    ip rule del ipproto tcp dport 21 table 200 priority 40 2>/dev/null || true
+                    ip rule del ipproto tcp dport 990 table 200 priority 40 2>/dev/null || true
+                    ip rule del ipproto tcp dport 20 table 200 priority 40 2>/dev/null || true
+                    ip rule del ipproto tcp sport 20 table 200 priority 40 2>/dev/null || true
+                    ip rule del ipproto tcp dport 989 table 200 priority 40 2>/dev/null || true
+                    ip rule del ipproto tcp sport 989 table 200 priority 40 2>/dev/null || true
+                    split_sync
+                fi
+                echo "Contournement FTP désactivé."
+                exit 0
+                ;;
+            *)
+                echo "Usage: $CMD_NAME ftp-bypass [on|off]" >&2
+                exit 1
+                ;;
+        esac
         ;;
 
     toggle)

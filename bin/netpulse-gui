@@ -77,7 +77,8 @@ def load_config():
         "show_upload": True,
         "show_session_total": True,
         "autostart": True,
-        "split_tunnel_mode": "disabled"
+        "split_tunnel_mode": "disabled",
+        "bypass_ftp": True
     }
     try:
         if os.path.exists(CONFIG_PATH):
@@ -223,6 +224,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
         # Split Tunneling State
         self.split_mode = self.config.get("split_tunnel_mode", "disabled")
         self.split_apps = self._load_split_apps()
+        self.bypass_ftp = self.config.get("bypass_ftp", True)
         self.updating_split_ui = False
         self.split_app_widgets = {}
 
@@ -506,9 +508,15 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 route_badge = w.get("route_badge")
                 if route_badge:
                     is_proxy_route = p.get("routing") == "proxy"
-                    route_badge.set_label("⚡ Proxy" if is_proxy_route else "🌐 Direct")
-                    route_badge.set_css_classes(["caption", "success" if is_proxy_route else "accent", "heading"])
-                    route_badge.set_tooltip_text("Routage actif : Proxy TUN" if is_proxy_route else "Routage actif : Connexion Directe")
+                    is_ftp = p.get("is_ftp", False)
+                    if is_ftp:
+                        route_badge.set_label("📁 FTP Direct")
+                        route_badge.set_css_classes(["caption", "accent", "heading"])
+                        route_badge.set_tooltip_text("Flux FTP direct (Exempté du proxy pour garantir les transferts sans timeout)")
+                    else:
+                        route_badge.set_label("⚡ Proxy" if is_proxy_route else "🌐 Direct")
+                        route_badge.set_css_classes(["caption", "success" if is_proxy_route else "accent", "heading"])
+                        route_badge.set_tooltip_text("Routage actif : Proxy TUN" if is_proxy_route else "Routage actif : Connexion Directe")
 
                 btn_split = w.get("btn_split")
                 if btn_split:
@@ -555,9 +563,15 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 suffix_box.set_valign(Gtk.Align.CENTER)
 
                 is_proxy_route = p.get("routing") == "proxy"
-                route_badge = Gtk.Label(label="⚡ Proxy" if is_proxy_route else "🌐 Direct")
-                route_badge.set_css_classes(["caption", "success" if is_proxy_route else "accent", "heading"])
-                route_badge.set_tooltip_text("Routage actif : Proxy TUN" if is_proxy_route else "Routage actif : Connexion Directe")
+                is_ftp = p.get("is_ftp", False)
+                if is_ftp:
+                    route_badge = Gtk.Label(label="📁 FTP Direct")
+                    route_badge.set_css_classes(["caption", "accent", "heading"])
+                    route_badge.set_tooltip_text("Flux FTP direct (Exempté du proxy pour garantir les transferts sans timeout)")
+                else:
+                    route_badge = Gtk.Label(label="⚡ Proxy" if is_proxy_route else "🌐 Direct")
+                    route_badge.set_css_classes(["caption", "success" if is_proxy_route else "accent", "heading"])
+                    route_badge.set_tooltip_text("Routage actif : Proxy TUN" if is_proxy_route else "Routage actif : Connexion Directe")
                 suffix_box.append(route_badge)
 
                 in_split = p.get("is_in_split", False)
@@ -736,6 +750,15 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self.split_mode_combo.connect("notify::selected", self._on_split_mode_combo_changed)
         group_split.add(self.split_mode_combo)
 
+        self.bypass_ftp_switch = Adw.SwitchRow()
+        self.bypass_ftp_switch.set_title("Exempter automatiquement les transferts FTP")
+        self.bypass_ftp_switch.set_subtitle(
+            "Isole les ports FTP (20, 21, 989, 990, flux passifs) et clients (FileZilla, Nautilus) du proxy"
+        )
+        self.bypass_ftp_switch.set_active(self.bypass_ftp)
+        self.bypass_ftp_switch.connect("notify::active", self._on_bypass_ftp_toggled)
+        group_split.add(self.bypass_ftp_switch)
+
         self.split_info_row = Adw.ActionRow()
         self.split_info_row.set_title("Comportement actif")
         group_split.add(self.split_info_row)
@@ -861,6 +884,32 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     "exclude": "Exclusif (Bypass)"
                 }
                 toast = Adw.Toast.new(f"Mode Split Tunneling : {mode_names.get(new_mode, new_mode)}")
+                self.toast_overlay.add_toast(toast)
+                self._refresh_tun_status()
+                self._poll_stats()
+            GLib.idle_add(on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_bypass_ftp_toggled(self, row, param):
+        if self.updating_split_ui:
+            return
+        is_active = self.bypass_ftp_switch.get_active()
+        if is_active == self.bypass_ftp:
+            return
+        self.bypass_ftp = is_active
+        self.config["bypass_ftp"] = is_active
+        save_config(self.config)
+
+        def worker():
+            env = os.environ.copy()
+            env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
+            arg = "on" if is_active else "off"
+            subprocess.run([self.ctl_bin, "ftp-bypass", arg], env=env, check=False)
+
+            def on_done():
+                status_text = "activée" if is_active else "désactivée"
+                toast = Adw.Toast.new(f"Exemption FTP : {status_text}")
                 self.toast_overlay.add_toast(toast)
                 self._refresh_tun_status()
                 self._poll_stats()
@@ -1105,6 +1154,14 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     self.updating_split_ui = False
                     self._update_split_info_subtitle()
                     self._render_split_apps_list()
+
+                bf_ftp = data.get("bypass_ftp")
+                if bf_ftp is not None and hasattr(self, "bypass_ftp_switch"):
+                    if self.bypass_ftp != bf_ftp:
+                        self.bypass_ftp = bf_ftp
+                        self.updating_split_ui = True
+                        self.bypass_ftp_switch.set_active(bf_ftp)
+                        self.updating_split_ui = False
             except Exception:
                 pass
 

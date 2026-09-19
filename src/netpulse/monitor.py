@@ -49,6 +49,11 @@ PID_FILE = "/tmp/netpulse_monitor.pid"
 CTL_BIN = os.path.expanduser("~/.local/bin/netpulse-ctl") if os.path.exists(os.path.expanduser("~/.local/bin/netpulse-ctl")) else os.path.expanduser("~/.local/bin/force-proxy-ctl")
 GUI_BIN = os.path.expanduser("~/.local/bin/netpulse-gui") if os.path.exists(os.path.expanduser("~/.local/bin/netpulse-gui")) else os.path.expanduser("~/.local/bin/force-proxy-gui")
 
+FTP_KNOWN_APPS = {
+    "filezilla", "ftp", "lftp", "ncftp", "gvfsd-ftp", "kio_ftp", "cyberduck", "tftp", "vsftpd", "proftpd", "pure-ftpd"
+}
+FTP_PORTS = {20, 21, 989, 990}
+
 SNI_XML = """
 <node>
   <interface name="org.kde.StatusNotifierItem">
@@ -668,10 +673,21 @@ class NetPulseEngine:
                 if pname.lower() in blocked_apps and pid not in cgroup_blocked_pids:
                     subprocess.Popen([CTL_BIN, "block", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                # Split Tunneling routing determination
+                # Split Tunneling & FTP routing determination
                 is_in_split = is_app_in_split_list(pname, cmdline, split_apps)
+                is_ftp = (pname.lower() in FTP_KNOWN_APPS) or any(
+                    (getattr(c, 'raddr', None) and getattr(c.raddr, 'port', None) in FTP_PORTS) or
+                    (getattr(c, 'laddr', None) and getattr(c.laddr, 'port', None) in FTP_PORTS)
+                    for c in c_list
+                )
+
                 if self.proxy_active:
-                    if split_mode == "include":
+                    if is_ftp and self.config.get("bypass_ftp", True):
+                        if pid not in cgroup_direct_pids:
+                            subprocess.Popen([CTL_BIN, "split-assign", str(pid), "direct"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            cgroup_direct_pids.add(pid)
+                        route_mode = "direct"
+                    elif split_mode == "include":
                         if is_in_split:
                             if pid not in cgroup_proxy_pids:
                                 subprocess.Popen([CTL_BIN, "split-assign", str(pid), "proxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -744,6 +760,7 @@ class NetPulseEngine:
                     "is_blocked": is_app_blocked,
                     "routing": route_mode,
                     "is_in_split": is_in_split,
+                    "is_ftp": is_ftp,
                     "status": status_text,
                     "connections_count": len(c_list),
                     "rx_speed": p_rx_speed,
@@ -769,6 +786,7 @@ class NetPulseEngine:
             "session_start": self.session_start,
             "session_duration_sec": session_duration,
             "proxy_active": self.proxy_active,
+            "bypass_ftp": self.config.get("bypass_ftp", True),
             "split_tunnel_mode": split_mode,
             "split_apps": sorted(list(split_apps)),
             "proxy_pids_count": len(cgroup_proxy_pids),
