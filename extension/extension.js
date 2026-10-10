@@ -23,6 +23,8 @@ class NetSpeedButton extends PanelMenu.Button {
         this._updatingSwitch = false;
         this._userToggledAt = 0;
         this._targetState = false;
+        this._proxyActive = false;
+        this._connectionProtected = true;
         this._destroyed = false;
         this._reading = false;
         this._cancellable = new Gio.Cancellable();
@@ -80,15 +82,10 @@ class NetSpeedButton extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // 3. Proxy & TUN Control
+        this._protectionItem = new PopupMenu.PopupMenuItem(_('🔒 Connexion protégée : confirmer dans NetPulse'), {reactive: false});
+        this.menu.addMenuItem(this._protectionItem);
         this._proxySwitch = new PopupMenu.PopupSwitchMenuItem(_('⚡ Forcer le Proxy (Mode TUN)'), false);
-        this._proxySwitch.connect('toggled', (item, state) => {
-            if (this._updatingSwitch)
-                return;
-            this._userToggledAt = Date.now();
-            this._targetState = state;
-            const action = state ? 'start' : 'stop';
-            this._spawn([this._ctlBin, action], true);
-        });
+        this._proxySwitch.connect('toggled', (_item, state) => this._onProxyToggled(state));
         this.menu.addMenuItem(this._proxySwitch);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -111,7 +108,7 @@ class NetSpeedButton extends PanelMenu.Button {
         // 5. Quit Action
         const quitItem = new PopupMenu.PopupMenuItem(_('🛑 Quitter NetPulse'));
         quitItem.connect('activate', () => {
-            this._spawn([this._ctlBin, 'quit']);
+            this._requestNetworkAction('quit');
         });
         this.menu.addMenuItem(quitItem);
 
@@ -121,6 +118,35 @@ class NetSpeedButton extends PanelMenu.Button {
             this._update();
             return GLib.SOURCE_CONTINUE;
         });
+    }
+
+    _requestNetworkAction(action) {
+        if (this._destroyed)
+            return false;
+        if (this._connectionProtected) {
+            Main.notify(_('Connexion protégée'), _('Pour modifier ou arrêter le tunnel, ouvrez NetPulse et confirmez le changement.'));
+            this._spawn([this._guiBin]);
+            return false;
+        }
+        this._spawn([this._ctlBin, action], true);
+        return true;
+    }
+
+    _onProxyToggled(state) {
+        if (this._updatingSwitch || this._destroyed)
+            return;
+        if (this._requestNetworkAction(state ? 'start' : 'stop')) {
+            this._userToggledAt = Date.now();
+            this._targetState = state;
+        } else {
+            this._userToggledAt = 0;
+            this._updatingSwitch = true;
+            try {
+                this._proxySwitch.setToggleState(this._proxyActive);
+            } finally {
+                this._updatingSwitch = false;
+            }
+        }
     }
 
     _formatDuration(sec) {
@@ -155,6 +181,8 @@ class NetSpeedButton extends PanelMenu.Button {
                 if (ok && !this._destroyed) {
                     const text = new TextDecoder().decode(contents);
                     const data = JSON.parse(text);
+                    this._connectionProtected = data.connection_protected !== false || data.network_actions_deferred === true;
+                    this._protectionItem.actor.visible = this._connectionProtected;
 
                     const rx = data.rx_speed_formatted || '0 o/s';
                     const tx = data.tx_speed_formatted || '0 o/s';
@@ -179,6 +207,7 @@ class NetSpeedButton extends PanelMenu.Button {
 
                     if ('proxy_active' in data) {
                         const isActive = !!data.proxy_active;
+                        this._proxyActive = isActive;
                         const elapsed = Date.now() - (this._userToggledAt || 0);
 
                         let shouldUpdate = true;

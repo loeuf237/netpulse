@@ -28,7 +28,7 @@ echo
 # 1. Vérification des dépendances système
 echo "[1/7] Vérification et installation des paquets requis..."
 MISSING_PKGS=()
-for pkg in python3-gi python3-cairo python3-gi-cairo gir1.2-rsvg-2.0 python3-psutil gir1.2-adw-1 gir1.2-gtk-4.0 gir1.2-dbusmenu-glib-0.4 iptables iproute2; do
+for pkg in python3-gi python3-cairo python3-gi-cairo gir1.2-rsvg-2.0 python3-psutil gir1.2-adw-1 gir1.2-gtk-4.0 gir1.2-dbusmenu-glib-0.4 gsettings-desktop-schemas iptables iproute2; do
     if ! dpkg -s "$pkg" >/dev/null 2>&1; then
         MISSING_PKGS+=("$pkg")
     fi

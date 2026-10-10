@@ -65,6 +65,8 @@ Conçu avec les technologies les plus récentes de l'écosystème Linux (**GTK4*
 - **Connexion protégée**, activée par défaut : bandeau pendant un tunnel actif,
   affectations automatiques différées et confirmation avant les changements réseau depuis
   l'interface. Désactiver cette protection autorise explicitement les automatismes.
+  Les raccourcis de l'indicateur GNOME et de l'icône système ouvrent l'interface pour
+  confirmer le changement, y compris l'arrêt complet demandé depuis l'indicateur.
 - **Diagnostic** : disponibilité TCP du serveur, état du tunnel, résolution DNS et requête
   HTTPS avec temps de réponse. Les sondes utilisent les routes existantes, sans les modifier.
   L'URL HTTPS par défaut est `https://github.com`, avec un intervalle de 60 secondes réglable.

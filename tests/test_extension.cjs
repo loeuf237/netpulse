@@ -5,12 +5,14 @@ const test = require('node:test');
 const path = require('node:path');
 
 function fixture(data) {
-    const state = {callback: null, removed: [], spawns: [], prompts: []};
+    const state = {callback: null, removed: [], spawns: [], prompts: [], notifications: []};
     const context = {
         TextDecoder, console,
         GObject: {registerClass: cls => cls},
         PanelMenu: {Button: class {destroy() {state.destroyed = true;}}},
         Extension: class {},
+        _: text => text,
+        Main: {notify: (...args) => state.notifications.push(args)},
         Gio: {
             File: {new_for_path: () => ({load_contents_async: (cancel, callback) => {state.callback = callback;}})},
             SubprocessFlags: {NONE: 0},
@@ -30,6 +32,8 @@ function fixture(data) {
         _destroyed: false, _reading: false, _cancellable: {cancel: () => {state.cancelled = true;}},
         _speedLabel: {}, _sessionSection: {actor: {}}, _userToggledAt: 0, _targetState: false,
         _proxySwitch: {state: false, setToggleState: value => {subject._proxySwitch.state = value;}},
+        _proxyActive: false, _connectionProtected: true, _protectionItem: {actor: {}},
+        _ctlBin: '/test/netpulse-ctl', _guiBin: '/test/netpulse-gui',
     });
     for (const name of ['_downSpeedItem', '_upSpeedItem', '_sessionRxItem', '_sessionTxItem', '_sessionDurationItem'])
         subject[name] = {label: {}};
@@ -75,4 +79,42 @@ test('proxy switch accepts the daemon state', () => {
     subject._update(); state.complete();
     assert.equal(subject._proxySwitch.state, true);
     assert.equal(subject._updatingSwitch, false);
+});
+
+test('protected switch restores actual state and opens GUI without stopping tunnel', () => {
+    const {subject, state} = fixture({proxy_active: true, connection_protected: true});
+    subject._update(); state.complete();
+    subject._onProxyToggled(false);
+    assert.equal(subject._proxySwitch.state, true);
+    assert.deepEqual(state.spawns, [['/test/netpulse-gui']]);
+    assert.equal(state.notifications.length, 1);
+    assert.equal(subject._protectionItem.actor.visible, true);
+    assert.equal(subject._userToggledAt, 0);
+});
+
+test('complete shutdown from protected indicator opens GUI without quitting NetPulse', () => {
+    const {subject, state} = fixture({});
+    assert.equal(subject._requestNetworkAction('quit'), false);
+    assert.deepEqual(state.spawns, [['/test/netpulse-gui']]);
+    assert.equal(state.notifications.length, 1);
+});
+
+test('unknown protection state stays guarded and explicit unlock allows a switch', () => {
+    const {subject, state} = fixture({proxy_active: true, connection_protected: false});
+    assert.equal(subject._connectionProtected, true);
+    subject._update(); state.complete();
+    subject._onProxyToggled(false);
+    assert.deepEqual(state.spawns, [['/test/netpulse-ctl', 'stop']]);
+    assert.equal(state.notifications.length, 0);
+    assert.equal(subject._protectionItem.actor.visible, false);
+    assert.equal(subject._targetState, false);
+    assert.deepEqual(state.prompts, [['NETPULSE_ALLOW_GUI_PROMPT', '1', true]]);
+});
+
+test('deferred network actions retain protection even if configuration is unlocked', () => {
+    const {subject, state} = fixture({proxy_active: true, connection_protected: false, network_actions_deferred: true});
+    subject._update(); state.complete();
+    assert.equal(subject._connectionProtected, true);
+    assert.equal(subject._requestNetworkAction('stop'), false);
+    assert.deepEqual(state.spawns, [['/test/netpulse-gui']]);
 });

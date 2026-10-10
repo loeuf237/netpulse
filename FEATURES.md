@@ -18,6 +18,9 @@ La collecte de fichiers et les sondes fonctionnent dans des threads indépendant
 La file de stockage est bornée ; ses erreurs sont affichées dans Diagnostic.
 La fermeture du moniteur laisse un délai borné pour terminer les écritures en attente.
 Les erreurs des notifications de bureau n'arrêtent ni le stockage ni le moniteur.
+En mode protégé, les raccourcis de l'indicateur GNOME et de l'icône système ouvrent
+l'interface pour confirmer un changement de tunnel. La mise à jour des fichiers de
+l'extension n'impose pas de rechargement de GNOME dans la session en cours.
 
 L'historique représente les mesures disponibles depuis l'activation de la version 1.1.
 Il distingue les octets physiques TCP+UDP des octets TCP échantillonnés par application.

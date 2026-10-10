@@ -49,6 +49,26 @@ class MonitorTests(unittest.TestCase):
             self.assertFalse(engine._ctl_async('block', '42'))
         spawn.assert_not_called()
 
+    def test_protected_tray_toggle_opens_gui_without_changing_tunnel(self):
+        engine = self.engine()
+        engine.proxy_active = True
+        engine.open_gui = Mock()
+        with patch.object(monitor.subprocess, 'Popen') as spawn:
+            engine.toggle_proxy()
+        engine.open_gui.assert_called_once()
+        spawn.assert_not_called()
+
+    def test_unprotected_tray_toggle_can_stop_tunnel_explicitly(self):
+        engine = self.engine()
+        engine.config['connection_protected'] = False
+        engine._protected_tunnel = None
+        engine.proxy_active = True
+        engine.open_gui = Mock()
+        with patch.object(monitor.subprocess, 'Popen') as spawn:
+            engine.toggle_proxy()
+        self.assertEqual(spawn.call_args.args[0], [monitor.CTL_BIN, 'stop'])
+        engine.open_gui.assert_not_called()
+
     def test_network_actions_resume_after_original_tunnel_is_replaced(self):
         engine = self.engine()
         engine._protected_tunnel = (10, 123)

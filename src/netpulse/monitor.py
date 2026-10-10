@@ -26,7 +26,7 @@ import fcntl
 import ipaddress
 from collections import deque
 import psutil
-from netpulse.features import FEATURE_DEFAULTS, FeatureService, rule_state
+from netpulse.features import FEATURE_DEFAULTS, FeatureService, proxy_display, rule_state
 
 # Nom de processus propre pour GNOME System Monitor ("Ressources")
 try:
@@ -659,6 +659,9 @@ class NetPulseEngine:
             pass
 
     def toggle_proxy(self):
+        if self.config.get("connection_protected", True) or getattr(self, "_protected_tunnel", None):
+            self.open_gui()
+            return
         action = "stop" if self.proxy_active else "start"
         try:
             subprocess.Popen([CTL_BIN, action], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -673,9 +676,11 @@ class NetPulseEngine:
                 was_active = self.proxy_active
                 self.proxy_active = bool(data.get("active"))
                 self.proxy_url = data.get("proxy", "") if self.proxy_active else ""
-                proxy_name = data.get("proxy", "TUN")
+                proxy_name = proxy_display(data.get("proxy", ""))
                 if self.enable_tray and hasattr(self, "mi_proxy"):
-                    if self.proxy_active:
+                    if self.config.get("connection_protected", True) or getattr(self, "_protected_tunnel", None):
+                        self.mi_proxy.property_set("label", "🔒 Connexion protégée : confirmer dans NetPulse")
+                    elif self.proxy_active:
                         self.mi_proxy.property_set("label", f"⚡ Forcer le Proxy : ACTIF ({proxy_name})")
                     else:
                         self.mi_proxy.property_set("label", "⚡ Forcer le Proxy (Mode TUN) : Inactif")
