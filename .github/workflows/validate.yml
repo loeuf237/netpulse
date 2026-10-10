@@ -21,7 +21,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-gi python3-cairo python3-gi-cairo python3-psutil python3-venv python3-pip gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-rsvg-2.0 xvfb
+          sudo apt-get install -y python3-gi python3-cairo python3-gi-cairo python3-psutil python3-venv python3-pip gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-rsvg-2.0 gsettings-desktop-schemas xvfb
           /usr/bin/python3 -m venv --system-site-packages .venv
           .venv/bin/python -m pip install build
       - uses: actions/setup-node@v6
@@ -46,6 +46,7 @@ jobs:
         env:
           GSETTINGS_BACKEND: memory
           GSK_RENDERER: cairo
+          GTK_A11Y: none
         run: xvfb-run -a .venv/bin/python tools/gui_smoke.py
       - name: Build and verify the wheel
         run: |
