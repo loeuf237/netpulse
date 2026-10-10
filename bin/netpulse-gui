@@ -15,6 +15,8 @@ import json
 import subprocess
 import threading
 import ctypes
+import tempfile
+import cairo
 import gi
 
 try:
@@ -29,8 +31,9 @@ gi.require_version('Gio', '2.0')
 gi.require_version('GLib', '2.0')
 gi.require_version('GObject', '2.0')
 gi.require_version('Gdk', '4.0')
+gi.require_version('Rsvg', '2.0')
 
-from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gdk
+from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gdk, Rsvg
 
 GLib.set_prgname("netpulse")
 GLib.set_application_name("NetPulse")
@@ -83,19 +86,32 @@ def load_config():
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return {**default_cfg, **json.load(f)}
+                cfg = {**default_cfg, **json.load(f)}
+                interval = cfg.get("refresh_interval")
+                if type(interval) is not int or interval not in (1, 2, 3):
+                    cfg["refresh_interval"] = 1
+                return cfg
     except Exception:
         pass
     return default_cfg
 
 
 def save_config(cfg):
+    tmp_path = None
     try:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+        updated = {**load_config(), **cfg}
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(CONFIG_PATH), delete=False) as f:
+            tmp_path = f.name
+            json.dump(updated, f, indent=2)
+        os.replace(tmp_path, CONFIG_PATH)
+        return True
     except Exception as e:
         print(f"Error saving config: {e}", file=sys.stderr)
+        return False
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def format_bytes(b):
@@ -111,6 +127,18 @@ def format_bytes(b):
 
 def format_speed(bps):
     return f"{format_bytes(bps)}/s"
+
+
+def render_svg_texture(svg, width, height):
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    viewport = Rsvg.Rectangle()
+    viewport.x, viewport.y, viewport.width, viewport.height = 0, 0, width, height
+    Rsvg.Handle.new_from_data(svg.encode("utf-8")).render_document(cairo.Context(surface), viewport)
+    surface.flush()
+    pixel_format = (Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED if sys.byteorder == "little"
+                    else Gdk.MemoryFormat.A8R8G8B8_PREMULTIPLIED)
+    return Gdk.MemoryTexture.new(width, height, pixel_format,
+                                 GLib.Bytes.new(bytes(surface.get_data())), surface.get_stride())
 
 
 def generate_svg_graph(history, width=720, height=130):
@@ -131,12 +159,16 @@ def generate_svg_graph(history, width=720, height=130):
     plot_h = max(height - margin_t - margin_b, 10)
 
     n_pts = len(history)
+    end_time = history[-1].get('t')
     step_x = plot_w / max(59, n_pts - 1)
 
     rx_pts = []
     tx_pts = []
     for i, d in enumerate(history):
-        x = margin_l + i * step_x
+        if end_time is not None and d.get('t') is not None:
+            x = margin_l + plot_w * max(0.0, min(1.0, (d['t'] - end_time + 60) / 60))
+        else:
+            x = margin_l + plot_w - (n_pts - 1 - i) * step_x
         y_rx = margin_t + plot_h - (min(d.get('rx', 0), max_rate) / max_rate) * plot_h
         y_tx = margin_t + plot_h - (min(d.get('tx', 0), max_rate) / max_rate) * plot_h
         rx_pts.append((x, y_rx))
@@ -211,6 +243,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self.is_busy = False
         self.user_toggled_at = 0.0
         self.target_force_state = None
+        self._closed = False
+        self._status_pending = False
         self.search_filter = ""
         self.filter_blocked_only = False
         self.current_processes = []
@@ -236,7 +270,32 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self._ensure_monitor_running()
 
         # Polling timer for UI updates
-        GLib.timeout_add_seconds(1, self._poll_stats)
+        self._poll_timer_id = GLib.timeout_add_seconds(1, self._poll_stats)
+        self.connect("close-request", self._on_close_request)
+
+    def _on_close_request(self, *_args):
+        self._closed = True
+        if self._poll_timer_id:
+            GLib.source_remove(self._poll_timer_id)
+            self._poll_timer_id = None
+        return False
+
+    def _run_ctl_action(self, args, success_message):
+        def worker():
+            try:
+                env = os.environ.copy()
+                env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
+                result = subprocess.run([self.ctl_bin, *args], env=env, capture_output=True, text=True, timeout=60)
+                message = success_message if result.returncode == 0 else (result.stderr.strip() or "La commande réseau a échoué.")
+            except Exception as exc:
+                message = f"Commande impossible : {exc}"
+            def done():
+                if not self._closed:
+                    self.toast_overlay.add_toast(Adw.Toast.new(message))
+                    self._poll_stats()
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(done)
+        threading.Thread(target=worker, daemon=True).start()
 
     def _load_split_apps(self):
         try:
@@ -248,7 +307,16 @@ class NetPulseWindow(Adw.ApplicationWindow):
         return []
 
     def _ensure_monitor_running(self):
-        if not os.path.exists("/tmp/netpulse_monitor.pid"):
+        running = False
+        try:
+            with open("/tmp/netpulse_monitor.pid", encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            if pid > 0:
+                with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+                    running = f.read().strip() == "netpulse-mon"
+        except (OSError, ValueError):
+            pass
+        if not running:
             try:
                 subprocess.Popen([self.mon_bin], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
@@ -451,7 +519,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
             if not self.search_filter:
                 return True
             q = self.search_filter
-            if q in p["name"].lower() or str(p["pid"]) in q:
+            if q in p["name"].lower() or q in str(p["pid"]):
                 return True
             for host in p.get("contacted_hosts", []):
                 if q in host.lower():
@@ -508,7 +576,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 route_badge = w.get("route_badge")
                 if route_badge:
                     is_proxy_route = p.get("routing") == "proxy"
-                    is_ftp = p.get("is_ftp", False)
+                    is_ftp = p.get("is_ftp", False) and self.bypass_ftp and not is_proxy_route
                     if is_ftp:
                         route_badge.set_label("📁 FTP Direct")
                         route_badge.set_css_classes(["caption", "accent", "heading"])
@@ -534,13 +602,14 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     btn_block.set_css_classes([])
                     btn_block.set_tooltip_text(f"Couper immédiatement tout accès internet à {pname} (Pare-feu)")
 
-                # If expanded, update sub-rows only if connection count changed
+                # Les hôtes et les adresses changent même lorsque le nombre de sockets reste stable.
                 conns = p.get("connections", [])
-                if expander.get_expanded() and len(conns) != len(w.get("sub_rows", [])):
+                if conns != w.get("connections"):
                     for sr in w.get("sub_rows", []):
                         expander.remove(sr)
                     new_sub_rows = self._build_socket_subrows(expander, conns)
                     w["sub_rows"] = new_sub_rows
+                    w["connections"] = conns
 
             # ---------------------------------------------------------
             # CREATE NEW ROW
@@ -563,7 +632,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 suffix_box.set_valign(Gtk.Align.CENTER)
 
                 is_proxy_route = p.get("routing") == "proxy"
-                is_ftp = p.get("is_ftp", False)
+                is_ftp = p.get("is_ftp", False) and self.bypass_ftp and not is_proxy_route
                 if is_ftp:
                     route_badge = Gtk.Label(label="📁 FTP Direct")
                     route_badge.set_css_classes(["caption", "accent", "heading"])
@@ -620,7 +689,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     "route_badge": route_badge,
                     "btn_split": btn_split,
                     "btn_block": btn_block,
-                    "sub_rows": sub_rows
+                    "sub_rows": sub_rows,
+                    "connections": p.get("connections", [])
                 }
 
     def _on_toggle_process_split(self, app_name):
@@ -677,25 +747,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
 
         action = "unblock-app" if currently_blocked else "block-app"
 
-        def worker():
-            try:
-                env = os.environ.copy()
-                env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
-                subprocess.run([self.ctl_bin, action, app_name], env=env, check=False)
-
-                def on_done():
-                    if not currently_blocked:
-                        toast = Adw.Toast.new(f"Application « {app_name} » bloquée par le pare-feu.")
-                    else:
-                        toast = Adw.Toast.new(f"Application « {app_name} » débloquée.")
-                    self.toast_overlay.add_toast(toast)
-                    self._poll_stats()
-
-                GLib.idle_add(on_done)
-            except Exception as e:
-                print(f"Error toggling block: {e}", file=sys.stderr)
-
-        threading.Thread(target=worker, daemon=True).start()
+        message = f"Application « {app_name} » {'débloquée' if currently_blocked else 'bloquée par le pare-feu'}."
+        self._run_ctl_action([action, app_name], message)
 
     # -----------------------------------------------------------------
     # ONGLET 2 : SERVEUR MANDATAIRE & FORÇAGE TUN
@@ -707,7 +760,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
         group_force = Adw.PreferencesGroup()
         group_force.set_title("Forçage global du système (Mode TUN)")
         group_force.set_description(
-            "Redirige 100% du trafic réseau de toutes les applications de ce PC vers votre proxy, "
+            "Redirige le trafic IPv4 de toutes les applications de ce PC vers votre proxy, "
             "y compris les applications qui ignorent les proxys standards (terminaux, snap-store, jeux, daemons)."
         )
         page.add(group_force)
@@ -856,7 +909,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
             )
         else:
             self.split_info_row.set_subtitle(
-                "Désactivé : 100% des connexions de l'ordinateur transitent par le proxy TUN."
+                "Global : le trafic IPv4 utilise le proxy TUN, avec les exemptions configurées."
             )
 
     def _on_split_mode_combo_changed(self, row, param):
@@ -869,27 +922,10 @@ class NetPulseWindow(Adw.ApplicationWindow):
             return
         self.split_mode = new_mode
         self.config["split_tunnel_mode"] = new_mode
-        save_config(self.config)
         self._update_split_info_subtitle()
         self._render_split_apps_list()
 
-        def worker():
-            env = os.environ.copy()
-            env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
-            subprocess.run([self.ctl_bin, "split-mode", new_mode], env=env, check=False)
-            def on_done():
-                mode_names = {
-                    "disabled": "Désactivé (Global)",
-                    "include": "Inclusif (Whitelist)",
-                    "exclude": "Exclusif (Bypass)"
-                }
-                toast = Adw.Toast.new(f"Mode Split Tunneling : {mode_names.get(new_mode, new_mode)}")
-                self.toast_overlay.add_toast(toast)
-                self._refresh_tun_status()
-                self._poll_stats()
-            GLib.idle_add(on_done)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_ctl_action(["split-mode", new_mode], f"Mode Split Tunneling : {new_mode}")
 
     def _on_bypass_ftp_toggled(self, row, param):
         if self.updating_split_ui:
@@ -899,23 +935,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
             return
         self.bypass_ftp = is_active
         self.config["bypass_ftp"] = is_active
-        save_config(self.config)
-
-        def worker():
-            env = os.environ.copy()
-            env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
-            arg = "on" if is_active else "off"
-            subprocess.run([self.ctl_bin, "ftp-bypass", arg], env=env, check=False)
-
-            def on_done():
-                status_text = "activée" if is_active else "désactivée"
-                toast = Adw.Toast.new(f"Exemption FTP : {status_text}")
-                self.toast_overlay.add_toast(toast)
-                self._refresh_tun_status()
-                self._poll_stats()
-            GLib.idle_add(on_done)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_ctl_action(["ftp-bypass", "on" if is_active else "off"],
+                             f"Exemption FTP : {'activée' if is_active else 'désactivée'}")
 
     def _on_add_split_app_clicked(self, btn):
         text = self.split_entry.get_text().strip().lower()
@@ -937,17 +958,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self._update_split_info_subtitle()
         self._render_split_apps_list()
 
-        def worker():
-            env = os.environ.copy()
-            env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
-            subprocess.run([self.ctl_bin, "split-add", app_name], env=env, check=False)
-            def on_done():
-                toast = Adw.Toast.new(f"Application « {app_name} » ajoutée au Split Tunneling.")
-                self.toast_overlay.add_toast(toast)
-                self._poll_stats()
-            GLib.idle_add(on_done)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_ctl_action(["split-add", app_name], f"Application « {app_name} » ajoutée au Split Tunneling.")
 
     def _del_split_app(self, app_name):
         app_name = app_name.strip().lower()
@@ -956,17 +967,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self._update_split_info_subtitle()
         self._render_split_apps_list()
 
-        def worker():
-            env = os.environ.copy()
-            env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
-            subprocess.run([self.ctl_bin, "split-del", app_name], env=env, check=False)
-            def on_done():
-                toast = Adw.Toast.new(f"Application « {app_name} » retirée du Split Tunneling.")
-                self.toast_overlay.add_toast(toast)
-                self._poll_stats()
-            GLib.idle_add(on_done)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_ctl_action(["split-del", app_name], f"Application « {app_name} » retirée du Split Tunneling.")
 
     def _render_split_apps_list(self):
         for app, row in list(self.split_app_widgets.items()):
@@ -1092,15 +1093,15 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self.config["show_upload"] = self.sw_show_up.get_active()
         self.config["unit_mode"] = "bits" if self.row_units.get_selected() == 1 else "auto"
         self.config["refresh_interval"] = self.row_interval.get_selected() + 1
-        save_config(self.config)
+        save_config({key: self.config[key] for key in ("show_download", "show_upload", "unit_mode", "refresh_interval")})
 
     def _on_autostart_changed(self, row, param):
         enabled = self.sw_autostart.get_active()
         self.config["autostart"] = enabled
-        save_config(self.config)
+        save_config({"autostart": enabled})
         action = "enable" if enabled else "disable"
         try:
-            subprocess.run(["systemctl", "--user", action, "force-proxy-monitor.service"], check=False)
+            subprocess.run(["systemctl", "--user", action, "netpulse-monitor.service"], check=False)
         except Exception:
             pass
 
@@ -1108,6 +1109,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
     # DONNÉES EN TEMPS RÉEL (POLLING & GRAPH UPDATE)
     # -----------------------------------------------------------------
     def _poll_stats(self):
+        if self._closed:
+            return GLib.SOURCE_REMOVE
         if not self.is_busy:
             self._refresh_tun_status()
 
@@ -1130,16 +1133,18 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 # Update live SVG graph
                 self.history_data = data.get("history", [])
                 svg_data = generate_svg_graph(self.history_data, width=720, height=130)
-                bytes_data = GLib.Bytes.new(svg_data.encode("utf-8"))
-                tex = Gdk.Texture.new_from_bytes(bytes_data)
-                self.graph_picture.set_paintable(tex)
+                try:
+                    self.graph_picture.set_paintable(render_svg_texture(svg_data, 720, 130))
+                except Exception as exc:
+                    print(f"Graph rendering failed: {exc}", file=sys.stderr)
 
                 self.current_processes = data.get("processes", [])
                 self._render_process_list()
 
                 # Sync Split Tunneling state from daemon
-                sp_mode = data.get("split_tunnel_mode", "disabled")
-                sp_apps = data.get("split_apps", [])
+                self.config = load_config()
+                sp_mode = self.config.get("split_tunnel_mode", "disabled")
+                sp_apps = self._load_split_apps()
                 if sp_mode != self.split_mode or sp_apps != self.split_apps:
                     self.split_mode = sp_mode
                     self.split_apps = sp_apps
@@ -1155,7 +1160,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     self._update_split_info_subtitle()
                     self._render_split_apps_list()
 
-                bf_ftp = data.get("bypass_ftp")
+                bf_ftp = self.config.get("bypass_ftp", True)
                 if bf_ftp is not None and hasattr(self, "bypass_ftp_switch"):
                     if self.bypass_ftp != bf_ftp:
                         self.bypass_ftp = bf_ftp
@@ -1209,8 +1214,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
             self.https_settings.set_int("port", int(self.https_port_spin.get_value()))
 
             raw_ignore = [x.strip() for x in self.ignore_entry.get_text().split(",") if x.strip()]
-            if raw_ignore:
-                self.settings.set_strv("ignore-hosts", raw_ignore)
+            self.settings.set_strv("ignore-hosts", raw_ignore)
 
             if show_toast:
                 toast = Adw.Toast.new("Paramètres du serveur mandataire enregistrés.")
@@ -1249,69 +1253,92 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self.tun_status_row.set_subtitle("Activation du mode TUN..." if want_active else "Désactivation...")
 
         def run_action():
+            error = None
             try:
                 env = os.environ.copy()
                 env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
-                subprocess.run(cmd, env=env, check=False)
+                result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+                if result.returncode != 0:
+                    error = result.stderr.strip() or "Le changement de routage a échoué."
+            except Exception as exc:
+                error = f"Commande impossible : {exc}"
             finally:
                 def finish():
                     self.is_busy = False
+                    if self._closed:
+                        return GLib.SOURCE_REMOVE
+                    if error:
+                        self.user_toggled_at = 0.0
+                        self.target_force_state = None
+                        self.toast_overlay.add_toast(Adw.Toast.new(error))
                     self._refresh_tun_status()
+                    return GLib.SOURCE_REMOVE
                 GLib.idle_add(finish)
 
         threading.Thread(target=run_action, daemon=True).start()
 
     def _refresh_tun_status(self):
-        if self.is_busy:
+        if self.is_busy or self._status_pending or self._closed:
             return
-        try:
-            res = subprocess.run([self.ctl_bin, "status", "--json"], capture_output=True, text=True, timeout=2)
-            if res.stdout:
-                data = json.loads(res.stdout)
-                is_active = bool(data.get("active"))
-                proxy_target = data.get("proxy", "Inconnu")
+        self._status_pending = True
+        def worker():
+            data = None
+            try:
+                result = subprocess.run([self.ctl_bin, "status", "--json"], capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    data = json.loads(result.stdout)
+            except Exception:
+                pass
+            def done():
+                self._status_pending = False
+                if not self._closed and not self.is_busy and isinstance(data, dict):
+                    self._apply_tun_status(data)
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(done)
+        threading.Thread(target=worker, daemon=True).start()
 
-                now = time.time()
-                toggled_at = getattr(self, "user_toggled_at", 0.0)
-                target_state = getattr(self, "target_force_state", None)
+    def _apply_tun_status(self, data):
+        is_active = bool(data.get("active"))
+        proxy_target = data.get("proxy", "Inconnu")
 
-                should_update = True
-                if (now - toggled_at) < 6.0 and target_state is not None:
-                    if is_active == target_state:
-                        self.user_toggled_at = 0.0
-                    else:
-                        should_update = False
+        now = time.time()
+        toggled_at = getattr(self, "user_toggled_at", 0.0)
+        target_state = getattr(self, "target_force_state", None)
 
-                if should_update and self.force_switch_row.get_active() != is_active:
-                    self.updating_switch = True
-                    self.force_switch_row.set_active(is_active)
-                    self.updating_switch = False
+        should_update = True
+        if (now - toggled_at) < 6.0 and target_state is not None:
+            if is_active == target_state:
+                self.user_toggled_at = 0.0
+            else:
+                should_update = False
 
-                sp_mode = data.get("split_mode", self.split_mode)
-                if is_active:
-                    cnt = len(self.split_apps)
-                    if sp_mode == "include":
-                        self.tun_status_row.set_subtitle(f"Mode Inclusif : {cnt} application(s) routée(s) vers {proxy_target}")
-                        self.tun_badge.set_label("Inclusif (TUN)")
-                    elif sp_mode == "exclude":
-                        self.tun_status_row.set_subtitle(f"Mode Exclusif : Tout vers {proxy_target}, sauf {cnt} application(s)")
-                        self.tun_badge.set_label("Exclusif (TUN)")
-                    else:
-                        self.tun_status_row.set_subtitle(f"Toutes les applications sont routées vers {proxy_target}")
-                        self.tun_badge.set_label("Global (TUN)")
-                    self.tun_badge.set_css_classes(["success", "heading"])
-                else:
-                    self.tun_status_row.set_subtitle("Le trafic réseau emprunte le chemin normal (par application)")
-                    self.tun_badge.set_label("Inactif")
-                    self.tun_badge.set_css_classes(["dim-label"])
-        except Exception:
-            pass
+        if should_update and self.force_switch_row.get_active() != is_active:
+            self.updating_switch = True
+            self.force_switch_row.set_active(is_active)
+            self.updating_switch = False
 
+        sp_mode = data.get("split_mode", self.split_mode)
+        if is_active:
+            cnt = len(self.split_apps)
+            if sp_mode == "include":
+                self.tun_status_row.set_subtitle(f"Mode Inclusif : {cnt} application(s) routée(s) vers {proxy_target}")
+                self.tun_badge.set_label("Inclusif (TUN)")
+            elif sp_mode == "exclude":
+                self.tun_status_row.set_subtitle(f"Mode Exclusif : Tout vers {proxy_target}, sauf {cnt} application(s)")
+                self.tun_badge.set_label("Exclusif (TUN)")
+            else:
+                self.tun_status_row.set_subtitle(f"Le trafic IPv4 est routé vers {proxy_target}, avec les exemptions configurées")
+                self.tun_badge.set_label("Global (TUN)")
+            self.tun_badge.set_css_classes(["success", "heading"])
+        else:
+            self.tun_status_row.set_subtitle("Le trafic réseau emprunte le chemin normal (par application)")
+            self.tun_badge.set_label("Inactif")
+            self.tun_badge.set_css_classes(["dim-label"])
 
 class NetPulseApp(Adw.Application):
-    def __init__(self):
+    def __init__(self, new_instance=False):
         super().__init__(application_id="org.antigravity.NetPulse",
-                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+                         flags=Gio.ApplicationFlags.NON_UNIQUE if new_instance else Gio.ApplicationFlags.FLAGS_NONE)
 
     def do_activate(self):
         Gtk.Window.set_default_icon_name("netpulse")
@@ -1322,8 +1349,9 @@ class NetPulseApp(Adw.Application):
 
 
 def main():
-    app = NetPulseApp()
-    sys.exit(app.run(sys.argv))
+    new_instance = "--new-instance" in sys.argv
+    app = NetPulseApp(new_instance=new_instance)
+    sys.exit(app.run([arg for arg in sys.argv if arg != "--new-instance"]))
 
 
 if __name__ == "__main__":

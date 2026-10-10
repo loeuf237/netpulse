@@ -15,12 +15,15 @@ import os
 import sys
 import time
 import json
+import math
 import socket
 import subprocess
 import signal
 import threading
 import re
 import ctypes
+import fcntl
+import ipaddress
 from collections import deque
 import psutil
 
@@ -46,6 +49,7 @@ SPLIT_APPS_FILE = os.path.join(CONFIG_DIR, "split_apps.txt")
 STATS_PATH = "/tmp/netpulse_stats.json"
 RESET_FLAG_PATH = "/tmp/netpulse_reset_flag"
 PID_FILE = "/tmp/netpulse_monitor.pid"
+LOCK_FILE = "/tmp/netpulse_monitor.lock"
 CTL_BIN = os.path.expanduser("~/.local/bin/netpulse-ctl") if os.path.exists(os.path.expanduser("~/.local/bin/netpulse-ctl")) else os.path.expanduser("~/.local/bin/force-proxy-ctl")
 GUI_BIN = os.path.expanduser("~/.local/bin/netpulse-gui") if os.path.exists(os.path.expanduser("~/.local/bin/netpulse-gui")) else os.path.expanduser("~/.local/bin/force-proxy-gui")
 
@@ -99,11 +103,13 @@ DEFAULT_CONFIG = {
     "show_download": True,
     "show_upload": True,
     "show_session_total": True,
-    "autostart": True
+    "autostart": True,
+    "split_tunnel_mode": "disabled",
+    "bypass_ftp": True
 }
 
 
-def get_network_io():
+def get_network_io(per_interface=False):
     """Calcule le trafic total cumulé sur toutes les interfaces physiques réelles.
     Exclut strictement loopback ('lo') et les interfaces de tunnels/conteneurs ('tun*', 'tap*', 'docker*').
     Fonctionne en tout temps, que le mode TUN soit actif ou non.
@@ -111,19 +117,25 @@ def get_network_io():
     pernic = psutil.net_io_counters(pernic=True)
     tot_recv = 0
     tot_sent = 0
+    interfaces = {}
     for nic, stat in pernic.items():
-        if nic == "lo" or nic.startswith(("tun", "tap", "veth", "docker", "virbr", "br-")):
+        if nic == "lo" or nic.startswith(("tun", "tap", "veth", "docker", "virbr", "br-", "proton", "pvpn", "wg", "zivpn", "lxc", "waydroid")):
             continue
         tot_recv += stat.bytes_recv
         tot_sent += stat.bytes_sent
-    return tot_recv, tot_sent
+        interfaces[nic] = (stat.bytes_recv, stat.bytes_sent)
+    return interfaces if per_interface else (tot_recv, tot_sent)
 
 
 def load_config():
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
+                config = {**DEFAULT_CONFIG, **json.load(f)}
+                interval = config.get("refresh_interval")
+                if type(interval) is not int or interval not in (1, 2, 3):
+                    config["refresh_interval"] = 1
+                return config
     except Exception:
         pass
     return DEFAULT_CONFIG.copy()
@@ -150,12 +162,14 @@ def load_split_apps():
 
 
 def is_app_in_split_list(pname, cmdline, split_apps):
+    """Correspondance exacte sur le nom du processus ou le binaire (argv[0]) uniquement.
+    Évite les faux positifs d'une recherche par sous-chaîne (ex: 'sh', 'python')."""
     if not split_apps:
         return False
     p_low = pname.lower()
-    cmd_low = cmdline.lower() if cmdline else ""
+    argv0 = os.path.basename(cmdline[0] if isinstance(cmdline, (list, tuple)) else cmdline.split(" ")[0]).lower() if cmdline else ""
     for app in split_apps:
-        if app in p_low or p_low in app or app in cmd_low:
+        if app == p_low or (argv0 and app == argv0):
             return True
     return False
 
@@ -198,11 +212,17 @@ def format_duration(sec):
     return f"{mins:02d}m {s:02d}s"
 
 
+SHELL_NAMES = {"bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "ptyxis", "gnome-terminal", "gnome-terminal-server", "konsole", "xterm", "kitty", "alacritty"}
+
+
 def resolve_icon(name):
     lower = name.lower()
-    if "chrome" in lower:
+    # Cas spécifiques d'abord, du plus précis au plus générique
+    if "antigravity" in lower:
+        return "antigravity-ide"
+    elif "chrome" in lower:
         return "google-chrome"
-    elif "edge" in lower or "msedge" in lower:
+    elif "msedge" in lower or lower.startswith("microsoft-edge") or lower == "edge":
         return "microsoft-edge"
     elif "firefox" in lower:
         return "firefox"
@@ -210,17 +230,15 @@ def resolve_icon(name):
         return "org.telegram.desktop"
     elif "steam" in lower:
         return "steam"
-    elif "antigravity" in lower:
-        return "antigravity-ide"
-    elif "code" in lower or "vscode" in lower:
-        return "code"
     elif "snap-store" in lower or "app-center" in lower:
         return "snap-store"
     elif "vlc" in lower:
         return "vlc"
+    elif lower == "code" or lower.startswith("code-") or "vscode" in lower:
+        return "code"
     elif "python" in lower:
         return "text-x-python"
-    elif "bash" in lower or "sh" in lower or "ptyxis" in lower:
+    elif lower in SHELL_NAMES:
         return "utilities-terminal"
     else:
         return "application-x-executable"
@@ -235,10 +253,14 @@ DNS_LOCK = threading.Lock()
 
 
 def async_resolve_ip(ip):
-    if not ip or ip == "-" or ip.startswith("127.") or ip.startswith("0.0.") or ip.startswith("::") or ip == "localhost":
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return
+    if address.is_loopback or address.is_unspecified:
         return
     with DNS_LOCK:
-        if ip in DNS_CACHE or ip in PENDING_DNS:
+        if ip in DNS_CACHE or ip in PENDING_DNS or len(PENDING_DNS) >= 8:
             return
         PENDING_DNS.add(ip)
 
@@ -248,6 +270,8 @@ def async_resolve_ip(ip):
         except Exception:
             host = ip
         with DNS_LOCK:
+            if len(DNS_CACHE) >= 2048:
+                DNS_CACHE.pop(next(iter(DNS_CACHE)))
             DNS_CACHE[ip] = host
             PENDING_DNS.discard(ip)
 
@@ -264,44 +288,51 @@ def get_resolved_host(ip):
 def parse_socket_traffic():
     """Extrait le trafic réseau réel de chaque socket (octets reçus et envoyés par PID) via ss -tipn."""
     try:
-        out = subprocess.check_output(['ss', '-tipn'], text=True)
+        out = subprocess.check_output(['ss', '-tHienp'], text=True, timeout=3, stderr=subprocess.DEVNULL)
     except Exception:
         return {}
 
     lines = out.splitlines()
     proc_bytes = {}
     cur_pids = []
+    socket_key = None
 
     for line in lines:
-        if line.startswith('ESTAB') or line.startswith('CLOSE-WAIT'):
-            pids = re.findall(r'pid=(\d+)', line)
-            names = re.findall(r'\"([^\"]+)\"', line)
-            cur_pids = list(zip(pids, names)) if pids else []
+        if line and not line[0].isspace():
+            # Les propriétaires et l'inode sont propres à chaque socket, quel que soit son état.
+            cur_pids = {(int(pid), name) for name, pid in re.findall(r'\("([^\"]+)",pid=(\d+)', line)}
+            inode = re.search(r'\bino:(\d+)', line)
+            fields = line.split()
+            socket_key = inode.group(1) if inode else tuple(fields[3:5])
         elif cur_pids and ('bytes_sent:' in line or 'bytes_received:' in line):
             bs_m = re.search(r'bytes_sent:(\d+)', line)
             br_m = re.search(r'bytes_received:(\d+)', line)
             bs = int(bs_m.group(1)) if bs_m else 0
             br = int(br_m.group(1)) if br_m else 0
-            for pid_str, name in cur_pids:
-                pid = int(pid_str)
-                prev = proc_bytes.get(pid, {'name': name, 'sent': 0, 'recv': 0})
+            for pid, name in cur_pids:
+                prev = proc_bytes.get(pid, {'name': name, 'sent': 0, 'recv': 0, 'sockets': {}})
                 prev['sent'] += bs
                 prev['recv'] += br
+                prev['sockets'][socket_key] = {'sent': bs, 'recv': br}
                 proc_bytes[pid] = prev
 
     return proc_bytes
 
 
 class NetPulseEngine:
-    def __init__(self, enable_tray=False):
+    def __init__(self, enable_tray=False, resume_session=False, preserve_active_tunnel=False):
         self.config = load_config()
         self.enable_tray = enable_tray
 
         self.session_start = time.time()
         self.last_time = self.session_start
+        self.last_monotonic = time.monotonic()
+        self.session_monotonic = self.last_monotonic
 
         # Starting bytes across all physical interfaces
-        self.last_rx, self.last_tx = get_network_io()
+        self.last_interfaces = get_network_io(per_interface=True)
+        self.last_rx = sum(value[0] for value in self.last_interfaces.values())
+        self.last_tx = sum(value[1] for value in self.last_interfaces.values())
 
         self.session_rx = 0
         self.session_tx = 0
@@ -312,6 +343,10 @@ class NetPulseEngine:
 
         # Bandwidth history buffer: 60 data points (60 seconds)
         self.history = deque(maxlen=60)
+        self._protected_tunnel = self._tunnel_identity() if preserve_active_tunnel else None
+
+        if resume_session:
+            self._restore_session()
 
         self.cur_rx_formatted = "0 o/s"
         self.cur_tx_formatted = "0 o/s"
@@ -334,16 +369,103 @@ class NetPulseEngine:
                 print(f"Tray initialization note: {e}", file=sys.stderr)
                 self.enable_tray = False
 
-    def _init_firewall(self):
+    # Délai minimal avant de relancer une même commande ctl (évite le spam de processus root)
+    CTL_RETRY_DELAY = 30.0
+
+    @staticmethod
+    def _tunnel_identity():
+        for path in ("/run/netpulse/tun2socks.pid", "/tmp/force-proxy.pid"):
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    pid = int(stream.read().strip())
+                process = psutil.Process(pid)
+                if process.name() == "tun2socks" and process.is_running():
+                    return pid, process.create_time()
+            except (OSError, ValueError, psutil.Error):
+                continue
+        return None
+
+    def _restore_session(self):
         try:
-            subprocess.Popen([CTL_BIN, "firewall-init"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with open(STATS_PATH, encoding="utf-8") as stream:
+                data = json.load(stream)
+            age = time.time() - data["timestamp"]
+            if not 0 <= age <= 15:
+                return
+            session_rx, session_tx = int(data["session_rx"]), int(data["session_tx"])
+            duration = max(int(data.get("session_duration_sec", 0)), 0)
+            session_start = float(data["session_start"])
+            if session_rx < 0 or session_tx < 0 or not math.isfinite(session_start):
+                return
+            self.session_rx, self.session_tx = session_rx, session_tx
+            self.session_start = session_start
+            self.session_monotonic = self.last_monotonic - duration
+            for item in data.get("history", []):
+                if not isinstance(item, dict):
+                    continue
+                values = [item.get(key) for key in ("t", "rx", "tx")]
+                if all(isinstance(value, (int, float)) and math.isfinite(value) for value in values):
+                    if time.time() - 60 <= values[0] <= time.time() and min(values[1:]) >= 0:
+                        self.history.append(item)
+            for item in data.get("processes", []):
+                try:
+                    pid = int(item["pid"])
+                    process = psutil.Process(pid)
+                    identity = process.create_time()
+                    if "create_time" in item:
+                        if item["create_time"] != identity:
+                            continue
+                    elif process.name() != item.get("name"):
+                        continue
+                    self.proc_traffic_history[pid] = {
+                        "identity": identity, "sockets": {}, "last_recv": 0, "last_sent": 0,
+                        "tot_rx": max(int(item["total_rx"]), 0),
+                        "tot_tx": max(int(item["total_tx"]), 0)
+                    }
+                except (KeyError, ValueError, TypeError, psutil.Error):
+                    continue
+        except (OSError, ValueError, TypeError, KeyError, OverflowError):
+            return
+
+    def _ctl_async(self, *args):
+        """Lance une commande netpulse-ctl sans doublons : pas de relance tant que la
+        précédente tourne ou pendant le délai de retry. Récolte les processus terminés."""
+        protected = getattr(self, "_protected_tunnel", None)
+        if protected:
+            if self._tunnel_identity() == protected:
+                return False
+            self._protected_tunnel = None
+        if not hasattr(self, "_ctl_jobs"):
+            self._ctl_jobs = {}
+        now = time.time()
+        # Récolte des processus terminés (évite les zombies)
+        for key, (proc, started) in list(self._ctl_jobs.items()):
+            if proc.poll() is not None and now - started >= self.CTL_RETRY_DELAY:
+                del self._ctl_jobs[key]
+        key = tuple(args)
+        job = self._ctl_jobs.get(key)
+        if job is not None:
+            return False
+        try:
+            proc = subprocess.Popen([CTL_BIN, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._ctl_jobs[key] = (proc, now)
+            return True
         except Exception:
-            pass
+            return False
+
+    def _init_firewall(self):
+        self._ctl_async("firewall-init")
 
     def reset_session(self):
         self.session_start = time.time()
         self.session_rx = 0
         self.session_tx = 0
+        self.last_interfaces = get_network_io(per_interface=True)
+        self.last_rx = sum(value[0] for value in self.last_interfaces.values())
+        self.last_tx = sum(value[1] for value in self.last_interfaces.values())
+        self.last_time = self.session_start
+        self.last_monotonic = time.monotonic()
+        self.session_monotonic = self.last_monotonic
         self.proc_traffic_history.clear()
         self.history.clear()
         if os.path.exists(RESET_FLAG_PATH):
@@ -538,14 +660,19 @@ class NetPulseEngine:
             self.reset_session()
 
         now = time.time()
-        dt = max(now - self.last_time, 0.001)
+        monotonic_now = time.monotonic()
+        dt = max(monotonic_now - self.last_monotonic, 0.001)
 
         # -------------------------------------------------------------
         # 1. Global network I/O: ALL PHYSICAL INTERFACES (Excludes TUN & lo)
         # -------------------------------------------------------------
-        cur_rx, cur_tx = get_network_io()
-        rx_diff = max(cur_rx - self.last_rx, 0)
-        tx_diff = max(cur_tx - self.last_tx, 0)
+        current_interfaces = get_network_io(per_interface=True)
+        rx_diff = sum(max(value[0] - self.last_interfaces.get(nic, value)[0], 0)
+                      for nic, value in current_interfaces.items())
+        tx_diff = sum(max(value[1] - self.last_interfaces.get(nic, value)[1], 0)
+                      for nic, value in current_interfaces.items())
+        cur_rx = sum(value[0] for value in current_interfaces.values())
+        cur_tx = sum(value[1] for value in current_interfaces.values())
 
         rx_speed = rx_diff / dt
         tx_speed = tx_diff / dt
@@ -556,6 +683,11 @@ class NetPulseEngine:
         self.last_rx = cur_rx
         self.last_tx = cur_tx
         self.last_time = now
+        self.last_monotonic = monotonic_now
+        self.last_interfaces = current_interfaces
+
+        while self.history and self.history[0]["t"] < now - 60:
+            self.history.popleft()
 
         # Add to historical buffer for graph
         self.history.append({
@@ -569,7 +701,7 @@ class NetPulseEngine:
         unit_mode = self.config.get("unit_mode", "auto")
         blocked_apps = load_blocked_apps()
 
-        session_duration = max(int(now - self.session_start), 1)
+        session_duration = max(int(monotonic_now - self.session_monotonic), 0)
 
         self.cur_rx_formatted = format_speed(rx_speed, unit_mode)
         self.cur_tx_formatted = format_speed(tx_speed, unit_mode)
@@ -584,15 +716,24 @@ class NetPulseEngine:
 
         proc_live_rates = {}
         for pid, sinfo in current_socket_traffic.items():
+            try:
+                identity = psutil.Process(pid).create_time()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
             hist = self.proc_traffic_history.get(pid, {
                 'last_recv': sinfo['recv'],
                 'last_sent': sinfo['sent'],
                 'tot_rx': 0,
                 'tot_tx': 0
             })
+            if hist.get('identity', identity) != identity:
+                hist = {'tot_rx': 0, 'tot_tx': 0, 'sockets': {}}
 
-            p_rx_diff = max(sinfo['recv'] - hist['last_recv'], 0)
-            p_tx_diff = max(sinfo['sent'] - hist['last_sent'], 0)
+            old_sockets = hist.get('sockets', {})
+            p_rx_diff = sum(max(sample['recv'] - old_sockets.get(key, sample)['recv'], 0)
+                            for key, sample in sinfo['sockets'].items())
+            p_tx_diff = sum(max(sample['sent'] - old_sockets.get(key, sample)['sent'], 0)
+                            for key, sample in sinfo['sockets'].items())
 
             p_rx_speed = p_rx_diff / dt
             p_tx_speed = p_tx_diff / dt
@@ -604,7 +745,9 @@ class NetPulseEngine:
                 'last_recv': sinfo['recv'],
                 'last_sent': sinfo['sent'],
                 'tot_rx': p_tot_rx,
-                'tot_tx': p_tot_tx
+                'tot_tx': p_tot_tx,
+                'sockets': sinfo['sockets'],
+                'identity': identity
             }
 
             proc_live_rates[pid] = {
@@ -628,12 +771,18 @@ class NetPulseEngine:
                 grouped_conns.setdefault(c.pid, []).append(c)
 
         process_list = []
+        # Un processus bloqué doit rester visible, même après la fermeture de ses sockets.
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            if is_app_in_split_list(proc.info.get('name') or '', proc.info.get('cmdline') or [], blocked_apps):
+                grouped_conns.setdefault(proc.pid, [])
         current_pids = set(grouped_conns.keys())
 
         # Clean terminated processes from history
         for pid in list(self.proc_traffic_history.keys()):
-            if pid not in current_pids:
+            if not psutil.pid_exists(pid):
                 del self.proc_traffic_history[pid]
+            elif pid not in current_socket_traffic:
+                self.proc_traffic_history[pid]['sockets'] = {}
 
         # Read currently blocked cgroup PIDs
         cgroup_blocked_pids = set()
@@ -663,18 +812,24 @@ class NetPulseEngine:
         except Exception:
             pass
 
+        for pid in cgroup_blocked_pids:
+            grouped_conns.setdefault(pid, [])
+
+        self.check_proxy_status()
         for pid, c_list in grouped_conns.items():
             try:
                 proc = psutil.Process(pid)
                 pname = proc.name()
-                cmdline = " ".join(proc.cmdline()[:3]) if proc.cmdline() else pname
+                argv = proc.cmdline()
+                cmdline = " ".join(argv[:3]) if argv else pname
 
-                is_app_blocked = (pname.lower() in blocked_apps) or (pid in cgroup_blocked_pids)
-                if pname.lower() in blocked_apps and pid not in cgroup_blocked_pids:
-                    subprocess.Popen([CTL_BIN, "block", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                matches_blocked = is_app_in_split_list(pname, argv, blocked_apps)
+                is_app_blocked = matches_blocked or (pid in cgroup_blocked_pids)
+                if matches_blocked and pid not in cgroup_blocked_pids:
+                    self._ctl_async("block", str(pid))
 
                 # Split Tunneling & FTP routing determination
-                is_in_split = is_app_in_split_list(pname, cmdline, split_apps)
+                is_in_split = is_app_in_split_list(pname, argv, split_apps)
                 is_ftp = (pname.lower() in FTP_KNOWN_APPS) or any(
                     (getattr(c, 'raddr', None) and getattr(c.raddr, 'port', None) in FTP_PORTS) or
                     (getattr(c, 'laddr', None) and getattr(c.laddr, 'port', None) in FTP_PORTS)
@@ -683,23 +838,14 @@ class NetPulseEngine:
 
                 if self.proxy_active:
                     if is_ftp and self.config.get("bypass_ftp", True):
-                        if pid not in cgroup_direct_pids:
-                            subprocess.Popen([CTL_BIN, "split-assign", str(pid), "direct"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            cgroup_direct_pids.add(pid)
                         route_mode = "direct"
                     elif split_mode == "include":
                         if is_in_split:
-                            if pid not in cgroup_proxy_pids:
-                                subprocess.Popen([CTL_BIN, "split-assign", str(pid), "proxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                cgroup_proxy_pids.add(pid)
                             route_mode = "proxy"
                         else:
                             route_mode = "direct"
                     elif split_mode == "exclude":
                         if is_in_split:
-                            if pid not in cgroup_direct_pids:
-                                subprocess.Popen([CTL_BIN, "split-assign", str(pid), "direct"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                cgroup_direct_pids.add(pid)
                             route_mode = "direct"
                         else:
                             route_mode = "proxy"
@@ -708,7 +854,20 @@ class NetPulseEngine:
                 else:
                     route_mode = "direct"
 
-                prate = proc_live_rates.get(pid, {'rx_speed': 0.0, 'tx_speed': 0.0, 'tot_rx': 0, 'tot_tx': 0})
+                if self.proxy_active and not is_app_blocked:
+                    destination = "default"
+                    if route_mode == "direct" and (split_mode != "include" or is_ftp and self.config.get("bypass_ftp", True)):
+                        destination = "direct"
+                    elif route_mode == "proxy" and split_mode == "include":
+                        destination = "proxy"
+                    if ((destination == "proxy" and pid not in cgroup_proxy_pids) or
+                        (destination == "direct" and pid not in cgroup_direct_pids) or
+                        (destination == "default" and pid in cgroup_proxy_pids | cgroup_direct_pids)):
+                        self._ctl_async("split-assign", str(pid), destination)
+
+                hist = self.proc_traffic_history.get(pid, {})
+                prate = proc_live_rates.get(pid, {'rx_speed': 0.0, 'tx_speed': 0.0,
+                                                 'tot_rx': hist.get('tot_rx', 0), 'tot_tx': hist.get('tot_tx', 0)})
                 p_rx_speed = prate['rx_speed']
                 p_tx_speed = prate['tx_speed']
                 p_tot_rx = prate['tot_rx']
@@ -754,6 +913,7 @@ class NetPulseEngine:
 
                 process_list.append({
                     "pid": pid,
+                    "create_time": proc.create_time(),
                     "name": pname,
                     "cmdline": cmdline,
                     "icon": resolve_icon(pname),
@@ -779,14 +939,16 @@ class NetPulseEngine:
 
         process_list.sort(key=lambda x: (x["rx_speed"] + x["tx_speed"], x["total_rx"] + x["total_tx"], x["connections_count"]), reverse=True)
 
-        self.check_proxy_status()
-
         payload = {
             "timestamp": now,
             "session_start": self.session_start,
             "session_duration_sec": session_duration,
             "proxy_active": self.proxy_active,
+            "network_actions_deferred": bool(getattr(self, "_protected_tunnel", None)),
             "bypass_ftp": self.config.get("bypass_ftp", True),
+            "show_download": self.config.get("show_download", True),
+            "show_upload": self.config.get("show_upload", True),
+            "show_session_total": self.config.get("show_session_total", True),
             "split_tunnel_mode": split_mode,
             "split_apps": sorted(list(split_apps)),
             "proxy_pids_count": len(cgroup_proxy_pids),
@@ -849,12 +1011,21 @@ class NetPulseEngine:
         signal.signal(signal.SIGTERM, handle_term)
         signal.signal(signal.SIGINT, handle_term)
 
-        interval = max(self.config.get("refresh_interval", 1), 1)
-        GLib.timeout_add_seconds(interval, self.collect)
+        self._schedule_collect()
         self.collect()
 
         loop = GLib.MainLoop()
         loop.run()
+
+    def _schedule_collect(self):
+        interval = self.config.get("refresh_interval", 1)
+        def tick():
+            try:
+                self.collect()
+            finally:
+                self._schedule_collect()
+            return GLib.SOURCE_REMOVE
+        GLib.timeout_add_seconds(interval, tick)
 
 
 def main():
@@ -865,8 +1036,19 @@ def main():
         sys.exit(0)
 
     enable_tray = "--tray" in sys.argv
-    engine = NetPulseEngine(enable_tray=enable_tray)
-    engine.run()
+    # Le verrou reste ouvert pendant toute la vie du démon ; un PID périmé ne le bloque pas.
+    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        return
+    engine = NetPulseEngine(enable_tray=enable_tray, resume_session="--resume-session" in sys.argv,
+                            preserve_active_tunnel="--preserve-active-tunnel" in sys.argv)
+    try:
+        engine.run()
+    finally:
+        os.close(lock_fd)
 
 
 if __name__ == "__main__":

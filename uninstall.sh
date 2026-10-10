@@ -41,6 +41,7 @@ rm -f "$BIN_DIR/netpulse"
 rm -f "$BIN_DIR/netpulse-gui"
 rm -f "$BIN_DIR/netpulse-monitor"
 rm -f "$BIN_DIR/netpulse-ctl"
+rm -f "$BIN_DIR/tun2socks"
 rm -f "$BIN_DIR/force-proxy-gui"
 rm -f "$BIN_DIR/force-proxy-monitor"
 rm -f "$BIN_DIR/force-proxy-ctl"
@@ -61,6 +62,8 @@ gtk-update-icon-cache -f -t "$ICON_DIR" 2>/dev/null || true
 echo "Suppression de la règle sudoers..."
 sudo rm -f /etc/sudoers.d/netpulse
 sudo rm -f /etc/sudoers.d/force-proxy
+sudo rm -f /usr/local/libexec/netpulse/netpulse-ctl /usr/local/libexec/netpulse/tun2socks
+sudo rmdir /usr/local/libexec/netpulse 2>/dev/null || true
 
 # 6. Suppression de l'extension GNOME
 echo "Désactivation et suppression de l'extension GNOME..."

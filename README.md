@@ -17,10 +17,10 @@ Conçu avec les technologies les plus récentes de l'écosystème Linux (**GTK4*
 
 ### 2. 🛑 Pare-feu applicatif en 1 clic (« Killswitch » par application)
 - Bouton **« Bloquer »** / **« Bloqué »** direct en face de chaque application et service.
-- **Coupure instantanée au niveau du noyau** :
+- **Blocage au niveau du noyau** :
   - Déplacement immédiat du processus dans un groupe de contrôle Linux (`cgroup v2` : `/sys/fs/cgroup/net_blocked`).
   - Blocage strict des paquets sortants via `iptables -m cgroup --path net_blocked -j REJECT`.
-  - Rupture immédiate de tous les sockets actifs ouverts (`ss -K`).
+  - Rupture immédiate de tous les sockets actifs ouverts (`ss -K`, avec sélection explicite des extrémités TCP).
 - **Persistance** : Si l'application est fermée puis relancée, le moniteur réapplique automatiquement l'interdiction réseau.
 - Filtre rapide **« Bloqués (Pare-feu) »** pour visualiser d'un clic les applications sous restriction.
 
@@ -32,14 +32,14 @@ Conçu avec les technologies les plus récentes de l'écosystème Linux (**GTK4*
   - Informations de connexion complètes : **Protocole (TCP/UDP)**, **IP distante : Port** ➔ **IP locale : Port**, et **État du socket** (`ESTABLISHED`, `LISTEN`...).
 
 ### 4. ⚡ Forçage global du proxy système (Mode TUN transparent)
-- Interception de **100 % du trafic réseau** de la machine via une interface virtuelle noyau (`tun-proxy`).
+- Interception du **trafic IPv4** de la machine, avec les exemptions configurées, via une interface virtuelle noyau (`tun-proxy`).
 - Redirige toutes les applications qui ignorent habituellement les proxys GNOME standards (commandes terminal `curl`/`wget`, paquets Snap, jeux, daemons système).
 - Prévention native des boucles de routage vers la passerelle physique.
 
 ### 5. 🔀 Routage sélectif par application (Split Tunneling Avancé)
 - **Triage intelligent du trafic** : choisissez au cas par cas quelles applications transitent par le proxy et lesquelles utilisent votre connexion internet directe.
-- **3 Modes de routage instantanés (sans interruption de session)** :
-  - **Mode Global (Désactivé)** : 100 % du trafic du PC transite par le proxy TUN.
+- **3 modes de routage** :
+  - **Mode Global (Désactivé)** : Le trafic IPv4 transite par le proxy TUN, avec les exemptions configurées.
   - **Mode Inclusif (Whitelist)** : Seules les applications sélectionnées (ex: `telegram`, `chrome`, `steam`) sont forcées via le proxy TUN. Tout le reste du système emprunte la connexion directe normale.
   - **Mode Exclusif (Bypass / Blacklist)** : Tout le PC transite par le proxy TUN, **sauf** les applications sélectionnées qui contournent le proxy et accèdent directement à internet.
 - **Gestion hybride GUI & CLI** :
@@ -73,7 +73,7 @@ Conçu avec les technologies les plus récentes de l'écosystème Linux (**GTK4*
 │                 netpulse-monitor                       │
 │    (Démon systemd utilisateur en arrière-plan)         │
 │  - Lecture tcp_info des sockets via ss -tipn           │
-│  - Mesure exacte sur l'interface physique (wlp0s...)   │
+│  - Mesure sur les interfaces physiques (wlp0s...)   │
 │  - Résolution asynchrone DNS inverse                   │
 │  - Publication StatusNotifierItem & JSON (/tmp)        │
 └──────────────┬──────────────────────────┬──────────────┘
@@ -133,7 +133,7 @@ netpulse/
 ## 🚀 Installation
 
 ### Prérequis
-- **Système d'exploitation** : Ubuntu 22.04+, 24.04+, Debian 12+, ou toute distribution Linux moderne avec GNOME.
+- **Système d'exploitation** : Ubuntu 24.04+, Debian 13+, ou une distribution fournissant GTK 4.8+, Libadwaita 1.4+ et librsvg 2.46+. L’extension requiert GNOME Shell 46 à 50.
 - **Python** : 3.10 ou supérieur.
 - **Droits d'administration** (`sudo`) pour la configuration initiale du réseau.
 
@@ -145,10 +145,10 @@ chmod +x install.sh
 ```
 
 Le script `install.sh` s'occupe de tout :
-1. Installe les dépendances nécessaires (`python3-psutil`, `gir1.2-adw-1`, `gir1.2-gtk-4.0`, `iptables`, `iproute2`...).
+1. Installe les dépendances nécessaires (`python3-psutil`, `python3-gi`, `python3-cairo`, `python3-gi-cairo`, `gir1.2-rsvg-2.0`, `gir1.2-adw-1`, `gir1.2-gtk-4.0`, `iptables`, `iproute2`...).
 2. Installe les exécutables dans `~/.local/bin/`.
 3. Configure l'icône système multi-résolutions (16x16 à 512x512 et SVG scalable) et le lanceur d'applications.
-4. Configure la règle `sudoers` pour permettre le contrôle sans mot de passe intempestif.
+4. Installe le contrôleur et tun2socks dans `/usr/local/libexec/netpulse/`, appartenant à root, puis valide la règle `sudoers` avec `visudo`. Les fichiers du proxy sont conservés dans `/run/netpulse/`.
 5. Active l'indicateur GNOME Shell dans votre barre supérieure.
 6. Démarre automatiquement le service d'arrière-plan `netpulse-monitor.service`.
 
@@ -264,3 +264,52 @@ chmod +x uninstall.sh
 * **100 % local** : NetPulse ne transmet aucune donnée télémétrique vers des serveurs externes.
 * Les requêtes DNS inverses sont effectuées directement par le résolveur système de votre machine.
 * Le filtrage réseau est assuré localement par le sous-système officiel `cgroup v2` du noyau Linux.
+
+
+## Vérification des corrections
+
+Depuis la racine du projet, avec les dépendances système installées :
+
+```bash
+python3 -m unittest discover -s tests -v
+node tests/test_extension.cjs
+bash -n install.sh uninstall.sh src/netpulse/ctl.sh
+```
+
+Les tests simulent les processus et commandes réseau ; ils ne démarrent ni n'arrêtent le proxy actif.
+Le détail de l'analyse se trouve dans [AUDIT.md](AUDIT.md).
+
+### Mise à jour avec un tunnel actif
+
+Pour migrer une installation existante en conservant la connexion et les fenêtres ouvertes :
+
+```bash
+python3 live-upgrade.py
+```
+
+La procédure sauvegarde les fichiers installés dans `~/.local/state/netpulse/backups/`,
+remplace les scripts atomiquement, adopte le PID du tunnel historique dans `/run/netpulse/`
+et relance uniquement le moniteur avec reprise de sa session. Elle vérifie que le PID,
+l'heure de création du tunnel, les routes IPv4, les règles de routage et l'interface TUN
+restent identiques. Une nouvelle fenêtre affiche les corrections sans fermer l'ancienne.
+Les fichiers de l'extension GNOME sont mis à jour ; leur chargement attend la prochaine session.
+
+Le moniteur est lancé avec `--resume-session --preserve-active-tunnel` : ses actions automatiques
+de pare-feu et de split tunneling sont différées pendant la vie du tunnel présent au lancement.
+Les commandes manuelles restent disponibles ; les automatismes reprennent lorsque ce tunnel
+est arrêté ou remplacé. Ce mode privilégie la stabilité de la connexion pendant la migration.
+
+La migration initiale utilise l'autorisation sudo déjà configurée. Si un contrôleur root
+plus ancien est déjà installé, le mettre à jour avant de lancer la procédure, sans arrêter le proxy :
+
+```bash
+sudo install -o root -g root -m 755 bin/netpulse-ctl /usr/local/libexec/netpulse/netpulse-ctl
+```
+
+### Portée des mesures et du routage
+
+- Le débit global comprend TCP et UDP sur les interfaces physiques. Les débits par processus proviennent de compteurs TCP échantillonnés ; UDP et les sockets ouvertes puis fermées entre deux relevés ne sont pas comptabilisés individuellement.
+- Un moniteur non privilégié peut ne pas connaître le PID de certaines connexions appartenant à d'autres utilisateurs.
+- Le proxy transparent configure les routes IPv4. Les règles IPv6 du pare-feu sont installées séparément ; elles ne constituent pas un routage TUN IPv6.
+- Un changement de cgroup s'applique aux sockets créées ensuite. Pour les connexions déjà ouvertes, le split tunneling peut nécessiter une reconnexion de l'application. Le blocage ferme les sockets TCP que le noyau permet de détruire ; il ne garantit pas la destruction des sockets UDP déjà ouvertes.
+- Les cgroups et les fichiers de statistiques actuels sont partagés à l'échelle de la machine : le fonctionnement simultané de plusieurs sessions utilisateur reste à isoler.

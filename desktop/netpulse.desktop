@@ -2,7 +2,7 @@
 Name=NetPulse
 GenericName=Moniteur Réseau & Pare-feu
 Comment=Surveillance du trafic par application (style GlassWire), pare-feu et forçage proxy TUN
-Exec=/home/paulin/.local/bin/force-proxy-gui
+Exec=netpulse-gui
 Icon=netpulse
 Terminal=false
 Type=Application

@@ -5,12 +5,18 @@
 
 set -e
 
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Lancez ./install.sh avec votre utilisateur de session ; sudo est appelé lorsque nécessaire." >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_USER="$(whoami)"
 HOME_DIR="$HOME"
 BIN_DIR="$HOME_DIR/.local/bin"
 APP_DIR="$HOME_DIR/.local/share/applications"
 ICON_DIR="$HOME_DIR/.local/share/icons/hicolor"
+ROOT_BIN_DIR="/usr/local/libexec/netpulse"
 SYSTEMD_USER_DIR="$HOME_DIR/.config/systemd/user"
 EXT_DIR="$HOME_DIR/.local/share/gnome-shell/extensions/force-proxy@paulin"
 
@@ -22,7 +28,7 @@ echo
 # 1. Vérification des dépendances système
 echo "[1/7] Vérification et installation des paquets requis..."
 MISSING_PKGS=()
-for pkg in python3-psutil gir1.2-adw-1 gir1.2-gtk-4.0 gir1.2-dbusmenu-glib-0.4 iptables iproute2; do
+for pkg in python3-gi python3-cairo python3-gi-cairo gir1.2-rsvg-2.0 python3-psutil gir1.2-adw-1 gir1.2-gtk-4.0 gir1.2-dbusmenu-glib-0.4 iptables iproute2; do
     if ! dpkg -s "$pkg" >/dev/null 2>&1; then
         MISSING_PKGS+=("$pkg")
     fi
@@ -63,22 +69,21 @@ echo "[3/7] Installation des icônes NetPulse..."
 mkdir -p "$ICON_DIR/scalable/apps"
 cp "$SCRIPT_DIR/icons/netpulse.svg" "$ICON_DIR/scalable/apps/netpulse.svg"
 
-python3 -c "
-import os
-import gi
-gi.require_version('Gtk', '4.0')
-from gi.repository import Gtk, Gdk, GLib
-
-svg_file = '$ICON_DIR/scalable/apps/netpulse.svg'
-if os.path.exists(svg_file):
-    svg_data = open(svg_file).read()
-    b = GLib.Bytes.new(svg_data.encode('utf-8'))
-    tex = Gdk.Texture.new_from_bytes(b)
-    for s in [16, 24, 32, 48, 64, 128, 256, 512]:
-        p = os.path.expanduser(f'~/.local/share/icons/hicolor/{s}x{s}/apps')
-        os.makedirs(p, exist_ok=True)
-        tex.save_to_png(os.path.join(p, 'netpulse.png'))
-" 2>/dev/null || true
+python3 - "$ICON_DIR" <<'PYICONS'
+import os, sys, cairo, gi
+gi.require_version("Rsvg", "2.0")
+from gi.repository import Rsvg
+icon_dir = sys.argv[1]
+handle = Rsvg.Handle.new_from_file(os.path.join(icon_dir, "scalable/apps/netpulse.svg"))
+for size in (16, 24, 32, 48, 64, 128, 256, 512):
+    destination = os.path.join(icon_dir, f"{size}x{size}", "apps")
+    os.makedirs(destination, exist_ok=True)
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    viewport = Rsvg.Rectangle()
+    viewport.x, viewport.y, viewport.width, viewport.height = 0, 0, size, size
+    handle.render_document(cairo.Context(surface), viewport)
+    surface.write_to_png(os.path.join(destination, "netpulse.png"))
+PYICONS
 
 gtk-update-icon-cache -f -t "$ICON_DIR" 2>/dev/null || true
 
@@ -86,11 +91,21 @@ gtk-update-icon-cache -f -t "$ICON_DIR" 2>/dev/null || true
 echo "[4/7] Enregistrement du lanceur de bureau..."
 mkdir -p "$APP_DIR"
 cp "$SCRIPT_DIR/desktop/netpulse.desktop" "$APP_DIR/netpulse.desktop"
+python3 - "$APP_DIR/netpulse.desktop" "$BIN_DIR/netpulse-gui" <<'PYDESKTOP'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+executable = sys.argv[2].replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%")
+path.write_text("\n".join(f'Exec="{executable}"' if line.startswith("Exec=") else line
+                          for line in path.read_text().splitlines()) + "\n")
+PYDESKTOP
 update-desktop-database "$APP_DIR" 2>/dev/null || true
 
 # 5. Configuration des droits sans mot de passe (sudoers) pour le pare-feu et le TUN
 echo "[5/7] Configuration des privilèges réseau (Sudoers)..."
-"$BIN_DIR/netpulse-ctl" update-sudoers 2>/dev/null || true
+sudo install -d -o root -g root -m 755 "$ROOT_BIN_DIR"
+sudo install -o root -g root -m 755 "$SCRIPT_DIR/bin/netpulse-ctl" "$ROOT_BIN_DIR/netpulse-ctl"
+sudo install -o root -g root -m 755 "$SCRIPT_DIR/bin/tun2socks" "$ROOT_BIN_DIR/tun2socks"
+sudo "$ROOT_BIN_DIR/netpulse-ctl" update-sudoers
 
 # 6. Installation de l'extension GNOME Shell (Indicateur barre supérieure)
 echo "[6/7] Installation de l'extension GNOME Shell..."

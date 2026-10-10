@@ -23,6 +23,9 @@ class NetSpeedButton extends PanelMenu.Button {
         this._updatingSwitch = false;
         this._userToggledAt = 0;
         this._targetState = false;
+        this._destroyed = false;
+        this._reading = false;
+        this._cancellable = new Gio.Cancellable();
 
         // Panel Bar Layout: [NetPulse Icon] [Speed Label]
         const box = new St.BoxLayout({
@@ -61,6 +64,7 @@ class NetSpeedButton extends PanelMenu.Button {
 
         // 2. Session Totals
         const sessionSection = new PopupMenu.PopupMenuSection();
+        this._sessionSection = sessionSection;
         this._sessionHeader = new PopupMenu.PopupMenuItem(_('📊 Données échangées (Session) :'), {reactive: false});
         this._sessionHeader.label.style = 'font-weight: bold; color: #8b949e;';
         sessionSection.addMenuItem(this._sessionHeader);
@@ -83,7 +87,7 @@ class NetSpeedButton extends PanelMenu.Button {
             this._userToggledAt = Date.now();
             this._targetState = state;
             const action = state ? 'start' : 'stop';
-            GLib.spawn_command_line_async(`${this._ctlBin} ${action}`);
+            this._spawn([this._ctlBin, action], true);
         });
         this.menu.addMenuItem(this._proxySwitch);
 
@@ -92,13 +96,13 @@ class NetSpeedButton extends PanelMenu.Button {
         // 4. Quick Actions
         const openAppItem = new PopupMenu.PopupMenuItem(_('🖥️ Ouvrir NetPulse...'));
         openAppItem.connect('activate', () => {
-            GLib.spawn_command_line_async(this._guiBin);
+            this._spawn([this._guiBin]);
         });
         this.menu.addMenuItem(openAppItem);
 
         const resetItem = new PopupMenu.PopupMenuItem(_('🔄 Réinitialiser les compteurs'));
         resetItem.connect('activate', () => {
-            GLib.spawn_command_line_async(`${this._monBin} --reset`);
+            this._spawn([this._monBin, '--reset']);
         });
         this.menu.addMenuItem(resetItem);
 
@@ -107,7 +111,7 @@ class NetSpeedButton extends PanelMenu.Button {
         // 5. Quit Action
         const quitItem = new PopupMenu.PopupMenuItem(_('🛑 Quitter NetPulse'));
         quitItem.connect('activate', () => {
-            GLib.spawn_command_line_async(`${this._ctlBin} quit`);
+            this._spawn([this._ctlBin, 'quit']);
         });
         this.menu.addMenuItem(quitItem);
 
@@ -129,18 +133,38 @@ class NetSpeedButton extends PanelMenu.Button {
         return `${mins}m ${s.toString().padStart(2, '0')}s`;
     }
 
+    _spawn(argv, allowPrompt = false) {
+        try {
+            const launcher = new Gio.SubprocessLauncher({flags: Gio.SubprocessFlags.NONE});
+            if (allowPrompt)
+                launcher.setenv('NETPULSE_ALLOW_GUI_PROMPT', '1', true);
+            launcher.spawnv(argv);
+        } catch (error) {
+            console.error(`NetPulse: ${error.message}`);
+        }
+    }
+
     _update() {
+        if (this._destroyed || this._reading)
+            return;
+        this._reading = true;
         const file = Gio.File.new_for_path(STATS_FILE);
-        file.load_contents_async(null, (source, result) => {
+        file.load_contents_async(this._cancellable, (source, result) => {
             try {
                 const [ok, contents] = source.load_contents_finish(result);
-                if (ok) {
+                if (ok && !this._destroyed) {
                     const text = new TextDecoder().decode(contents);
                     const data = JSON.parse(text);
 
                     const rx = data.rx_speed_formatted || '0 o/s';
                     const tx = data.tx_speed_formatted || '0 o/s';
-                    this._speedLabel.text = `↓ ${rx}  ↑ ${tx}`;
+                    const speeds = [];
+                    if (data.show_download !== false)
+                        speeds.push(`↓ ${rx}`);
+                    if (data.show_upload !== false)
+                        speeds.push(`↑ ${tx}`);
+                    this._speedLabel.text = speeds.join('  ');
+                    this._sessionSection.actor.visible = data.show_session_total !== false;
 
                     this._downSpeedItem.label.text = `📥 Réception : ${rx}`;
                     this._upSpeedItem.label.text = `📤 Envoi : ${tx}`;
@@ -178,11 +202,15 @@ class NetSpeedButton extends PanelMenu.Button {
                 }
             } catch (e) {
                 // ignore transient read
+            } finally {
+                this._reading = false;
             }
         });
     }
 
     destroy() {
+        this._destroyed = true;
+        this._cancellable.cancel();
         if (this._timerId) {
             GLib.Source.remove(this._timerId);
             this._timerId = null;

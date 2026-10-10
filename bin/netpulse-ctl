@@ -2,19 +2,49 @@
 # force-proxy-ctl: Management script for transparent TUN proxy routing
 
 TUN_NAME="tun-proxy"
-PID_FILE="/tmp/force-proxy.pid"
-STATE_FILE="/tmp/force-proxy-current.txt"
-LOG_FILE="/tmp/tun2socks.log"
-TARGET_USER="paulin"
-TUN2SOCKS_BIN="/home/paulin/.local/bin/tun2socks"
+PID_FILE="/run/netpulse/tun2socks.pid"
+STATE_FILE="/run/netpulse/proxy.txt"
+LOG_FILE="/run/netpulse/tun2socks.log"
 REAL_SCRIPT="$(readlink -f "$0")"
+ROOT_CTL="/usr/local/libexec/netpulse/netpulse-ctl"
 
-SPLIT_DIR="/home/$TARGET_USER/.config/force-proxy"
+# Détection dynamique de l'utilisateur cible (propriétaire de la session)
+if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+    TARGET_USER="$SUDO_USER"
+elif [ -n "$PKEXEC_UID" ]; then
+    TARGET_USER="$(id -un "$PKEXEC_UID" 2>/dev/null)"
+elif [ "$(id -u)" -ne 0 ]; then
+    TARGET_USER="$(id -un)"
+else
+    TARGET_USER="$(stat -c %U "$REAL_SCRIPT" 2>/dev/null)"
+fi
+[ -z "$TARGET_USER" ] && TARGET_USER="root"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+[ -z "$TARGET_HOME" ] && TARGET_HOME="/home/$TARGET_USER"
+TUN2SOCKS_BIN="/usr/local/libexec/netpulse/tun2socks"
+USER_BIN="$TARGET_HOME/.local/bin"
+
+# Supprime de manière sûre la ligne exacte $2 du fichier $1 (aucune interprétation par sed/regex)
+remove_exact_line() {
+    local file="$1" line="$2" tmp result
+    [ -f "$file" ] || return 0
+    tmp="$(mktemp "${file}.XXXXXX")" || return 1
+    grep -vxF -- "$line" "$file" > "$tmp"
+    result=$?
+    if [ "$result" -gt 1 ]; then rm -f "$tmp"; return "$result"; fi
+    chmod --reference="$file" "$tmp" || { rm -f "$tmp"; return 1; }
+    chown --reference="$file" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$file"
+}
+
+SPLIT_DIR="$TARGET_HOME/.config/force-proxy"
 SPLIT_FILE="$SPLIT_DIR/split_apps.txt"
 CONFIG_FILE="$SPLIT_DIR/config.json"
 CGROUP_PROXY="/sys/fs/cgroup/net_proxy"
 CGROUP_DIRECT="/sys/fs/cgroup/net_direct"
 CGROUP_BLOCKED="/sys/fs/cgroup/net_blocked"
+ORIGINAL_CGROUP_DIR="/run/netpulse/original-cgroups"
+PROXY_ROUTE_FILE="/run/netpulse/proxy-route"
 
 # Quick check command for sudo validation
 if [ "$1" = "check-sudo" ]; then
@@ -63,6 +93,7 @@ Pare-feu Applicatif (GlassWire Killswitch) :
 Général :
   gui, open                Ouvrir l'interface graphique NetPulse
   reset-session            Réinitialiser les compteurs de session réseau (débits / volumes)
+  install-runtime          Installer le contrôleur privilégié et adopter le tunnel existant sans le relancer
   quit, exit               Fermer complètement NetPulse (démon, interface et proxy)
   help, -h, --help         Afficher cette aide
 
@@ -87,27 +118,45 @@ get_status() {
 read_split_mode() {
     if [ -f "$CONFIG_FILE" ]; then
         mode=$(grep -oP '"split_tunnel_mode"\s*:\s*"\K[^"]+' "$CONFIG_FILE" 2>/dev/null)
-        if [ -n "$mode" ]; then
-            echo "$mode"
-            return 0
-        fi
+        case "$mode" in disabled|include|exclude) echo "$mode"; return 0 ;; esac
     fi
     echo "disabled"
 }
 
+save_json_setting() {
+    local key="$1" value="$2"
+    mkdir -p "$SPLIT_DIR" || return 1
+    python3 - "$CONFIG_FILE" "$key" "$value" <<'PYJSON'
+import json, os, sys, tempfile
+path, key, value = sys.argv[1:]
+try:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            config = json.load(stream)
+    except FileNotFoundError:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError("la configuration doit être un objet JSON")
+    config[key] = json.loads(value)
+    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(config, stream, indent=2)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+except (OSError, ValueError) as exc:
+    print(f"Erreur de configuration : {exc}", file=sys.stderr)
+    sys.exit(1)
+PYJSON
+    local result=$?
+    [ "$result" -eq 0 ] || return "$result"
+    chown "$TARGET_USER:$(id -gn "$TARGET_USER")" "$CONFIG_FILE" 2>/dev/null || true
+}
+
 save_split_mode() {
-    local new_mode="$1"
-    mkdir -p "$SPLIT_DIR"
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "{ \"split_tunnel_mode\": \"$new_mode\" }" > "$CONFIG_FILE"
-    else
-        if grep -q '"split_tunnel_mode"' "$CONFIG_FILE" 2>/dev/null; then
-            sed -i -E "s/\"split_tunnel_mode\"\s*:\s*\"[^\"]*\"/\"split_tunnel_mode\": \"$new_mode\"/" "$CONFIG_FILE"
-        else
-            sed -i -E "s/(\s*)\}\s*$/,\n\1  \"split_tunnel_mode\": \"$new_mode\"\n}/" "$CONFIG_FILE"
-        fi
-    fi
-    chown "$TARGET_USER:$TARGET_USER" "$CONFIG_FILE" 2>/dev/null || true
+    save_json_setting split_tunnel_mode "\"$1\""
 }
 
 read_bypass_ftp() {
@@ -122,20 +171,37 @@ read_bypass_ftp() {
 }
 
 save_bypass_ftp() {
-    local enabled="$1" # 1 ou 0
-    local bool_str="true"
-    [ "$enabled" = "0" ] || [ "$enabled" = "off" ] || [ "$enabled" = "false" ] && bool_str="false"
-    mkdir -p "$SPLIT_DIR"
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "{ \"bypass_ftp\": $bool_str }" > "$CONFIG_FILE"
-    else
-        if grep -q '"bypass_ftp"' "$CONFIG_FILE" 2>/dev/null; then
-            sed -i -E "s/\"bypass_ftp\"\s*:\s*(true|false)/\"bypass_ftp\": $bool_str/" "$CONFIG_FILE"
-        else
-            sed -i -E "s/(\s*)\}\s*$/,\n\1  \"bypass_ftp\": $bool_str\n}/" "$CONFIG_FILE"
-        fi
-    fi
-    chown "$TARGET_USER:$TARGET_USER" "$CONFIG_FILE" 2>/dev/null || true
+    local bool_str=true
+    case "$1" in 0|off|false) bool_str=false ;; esac
+    save_json_setting bypass_ftp "$bool_str"
+}
+
+normalize_app_name() {
+    python3 - "$1" <<'PYNAME'
+import sys
+name = sys.argv[1].strip().lower()
+if not name or "\n" in name or "\r" in name:
+    sys.exit(1)
+print(name)
+PYNAME
+}
+
+find_app_pids() {
+    # pgrep traite son argument comme une expression régulière et tronque les noms longs.
+    python3 - "$1" <<'PYPIDS'
+import glob, os, sys
+name = sys.argv[1].lower()
+for directory in glob.glob("/proc/[0-9]*"):
+    try:
+        with open(directory + "/comm", encoding="utf-8") as stream:
+            comm = stream.read().strip().lower()
+        with open(directory + "/cmdline", "rb") as stream:
+            argv0 = os.fsdecode(stream.read().split(b"\0")[0])
+        if name in (comm, os.path.basename(argv0).lower()):
+            print(os.path.basename(directory))
+    except (OSError, UnicodeError):
+        continue
+PYPIDS
 }
 
 # Commandes exécutables immédiatement sans droits root
@@ -145,11 +211,11 @@ case "$1" in
         exit 0
         ;;
     gui|open)
-        gtk-launch netpulse 2>/dev/null || nohup /home/paulin/.local/bin/force-proxy-gui >/dev/null 2>&1 &
+        gtk-launch netpulse 2>/dev/null || nohup "$USER_BIN/netpulse-gui" >/dev/null 2>&1 &
         exit 0
         ;;
     reset-session|reset)
-        /home/paulin/.local/bin/netpulse-monitor --reset 2>/dev/null || /home/paulin/.local/bin/force-proxy-monitor --reset 2>/dev/null || true
+        "$USER_BIN/netpulse-monitor" --reset 2>/dev/null || "$USER_BIN/force-proxy-monitor" --reset 2>/dev/null || true
         exit 0
         ;;
     quit|exit)
@@ -179,7 +245,7 @@ case "$1" in
     split-status)
         mode=$(read_split_mode)
         app_count=0
-        [ -f "$SPLIT_FILE" ] && app_count=$(grep -cv '^\s*$' "$SPLIT_FILE" 2>/dev/null || echo 0)
+        [ -f "$SPLIT_FILE" ] && app_count=$(awk 'NF {n++} END {print n+0}' "$SPLIT_FILE")
         proxy_pids_count=0
         [ -f "$CGROUP_PROXY/cgroup.procs" ] && proxy_pids_count=$(wc -l < "$CGROUP_PROXY/cgroup.procs" 2>/dev/null || echo 0)
         direct_pids_count=0
@@ -188,7 +254,7 @@ case "$1" in
         if [ "$2" = "--json" ]; then
             apps_json="[]"
             if [ -f "$SPLIT_FILE" ]; then
-                apps_json=$(python3 -c "import json; print(json.dumps([l.strip().lower() for l in open('$SPLIT_FILE') if l.strip()]))" 2>/dev/null || echo "[]")
+                apps_json=$(python3 -c 'import json,sys; print(json.dumps([line.strip().lower() for line in open(sys.argv[1], encoding="utf-8") if line.strip()]))' "$SPLIT_FILE" 2>/dev/null || echo "[]")
             fi
             echo "{\"mode\": \"$mode\", \"apps_count\": $app_count, \"proxy_pids\": $proxy_pids_count, \"direct_pids\": $direct_pids_count, \"apps\": $apps_json}"
             exit 0
@@ -242,6 +308,15 @@ read_gnome_proxy() {
     fi
 }
 
+print_status_json() {
+    python3 - "$1" "$2" "$TUN_NAME" "$3" "$4" <<'PYSTATUS'
+import json, sys
+active, proxy, device, mode, ftp = sys.argv[1:]
+print(json.dumps(dict(active=active == "true", proxy=proxy, device=device,
+                      split_mode=mode, bypass_ftp=ftp == "1")))
+PYSTATUS
+}
+
 # -------------------------------------------------------------
 # 1. STATUS: DOES NOT REQUIRE ROOT PRIVILEGES (NEVER CALL SUDO/PKEXEC)
 # -------------------------------------------------------------
@@ -253,11 +328,11 @@ if [ "$1" = "status" ]; then
     if [ "$2" = "--json" ]; then
         if get_status; then
             curr_proxy=$(cat "$STATE_FILE" 2>/dev/null || read_gnome_proxy)
-            echo "{\"active\": true, \"proxy\": \"$curr_proxy\", \"device\": \"$TUN_NAME\", \"split_mode\": \"$split_mode\", \"bypass_ftp\": $([ "$bypass_ftp" = "1" ] && echo true || echo false)}"
+            print_status_json true "$curr_proxy" "$split_mode" "$bypass_ftp"
             exit 0
         else
             gnome_proxy=$(read_gnome_proxy)
-            echo "{\"active\": false, \"proxy\": \"$gnome_proxy\", \"device\": \"$TUN_NAME\", \"split_mode\": \"$split_mode\", \"bypass_ftp\": $([ "$bypass_ftp" = "1" ] && echo true || echo false)}"
+            print_status_json false "$gnome_proxy" "$split_mode" "$bypass_ftp"
             exit 0
         fi
     else
@@ -275,7 +350,7 @@ fi
 if [ "$1" = "ftp-status" ]; then
     bypass_ftp=$(read_bypass_ftp)
     rules_active="Non"
-    if ip rule show 2>/dev/null | grep -q "dport 21.*lookup 200"; then
+    if ip rule show 2>/dev/null | grep -q "fwmark 0x2000/0x2000.*lookup 200"; then
         rules_active="Oui"
     fi
     ct_loaded="Non"
@@ -310,19 +385,23 @@ fi
 # 2. PRIVILEGE ESCALATION ONLY FOR ACTIONS REQUIRING ROOT
 # -------------------------------------------------------------
 if [ "$(id -u)" -ne 0 ]; then
+    if [ ! -x "$ROOT_CTL" ]; then
+        echo "NetPulse: Le contrôleur privilégié est absent. Lancez ./install.sh depuis le projet." >&2
+        exit 1
+    fi
     # 1. Try passwordless sudo first (configured via /etc/sudoers.d/netpulse)
-    if sudo -n "$REAL_SCRIPT" check-sudo >/dev/null 2>&1; then
-        exec sudo "$REAL_SCRIPT" "$@"
+    if sudo -n "$ROOT_CTL" check-sudo >/dev/null 2>&1; then
+        exec sudo "$ROOT_CTL" "$@"
     fi
 
     # 2. If running interactively in a terminal, prompt via sudo in the terminal
     if [ -t 0 ] || [ -t 1 ]; then
-        exec sudo "$REAL_SCRIPT" "$@"
+        exec sudo "$ROOT_CTL" "$@"
     fi
 
     # 3. If explicitly requested with GUI prompt flag (from interactive GUI click)
     if [ "$NETPULSE_ALLOW_GUI_PROMPT" = "1" ]; then
-        exec pkexec "$REAL_SCRIPT" "$@"
+        exec pkexec "$ROOT_CTL" "$@"
     fi
 
     # 4. In background / daemon / boot mode, NEVER pop up graphical pkexec prompts!
@@ -335,8 +414,10 @@ fi
 # -------------------------------------------------------------
 
 get_net_info() {
-    def_line=$(ip -4 route show default 2>/dev/null | grep -v "${TUN_NAME}" | head -n 1)
-    [ -z "$def_line" ] && def_line=$(ip -4 route show 2>/dev/null | grep -v "${TUN_NAME}" | grep -E "via|default" | head -n 1)
+    # Priorité absolue aux interfaces physiques réelles (WiFi, Ethernet, LTE)
+    def_line=$(ip -4 route show default 2>/dev/null | grep -E "dev (wl|en|eth|ww)" | head -n 1)
+    [ -z "$def_line" ] && def_line=$(ip -4 route show 2>/dev/null | grep -E "dev (wl|en|eth|ww)" | grep -E "via|default" | head -n 1)
+    [ -z "$def_line" ] && def_line=$(ip -4 route show default 2>/dev/null | grep -v -E "tun|tap|proton|wg|zivpn|docker|veth|br-|lxc" | head -n 1)
     [ -z "$def_line" ] && def_line=$(ip -4 route show default 2>/dev/null | head -n 1)
 
     default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
@@ -349,245 +430,257 @@ get_net_info() {
     fi
 }
 
+ensure_policy_rule() {
+    local mark="$1" table="$2" priority="$3"
+    ip -4 rule show priority "$priority" | grep -Fq "fwmark $mark lookup $table" ||
+        ip rule add fwmark "$mark" table "$table" priority "$priority"
+}
+
 split_setup_rules() {
     get_net_info
-    mkdir -p "$CGROUP_PROXY" "$CGROUP_DIRECT" "$CGROUP_BLOCKED"
-    chown -R "$TARGET_USER:$TARGET_USER" "$CGROUP_PROXY" "$CGROUP_DIRECT" "$CGROUP_BLOCKED" 2>/dev/null || true
+    mkdir -p "$CGROUP_PROXY" "$CGROUP_DIRECT" "$CGROUP_BLOCKED" || return 1
 
-    # 1. iptables mangle OUTPUT marks
-    iptables -t mangle -C OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || \
-        iptables -t mangle -A OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000
-    iptables -t mangle -C OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || \
-        iptables -t mangle -A OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000
+    # Les bits NetPulse sont exclusifs ; les autres bits de la marque sont préservés.
+    iptables -t mangle -C OUTPUT -m cgroup --path "net_proxy" -j MARK --set-xmark 0x1000/0x3000 2>/dev/null || \
+        iptables -t mangle -A OUTPUT -m cgroup --path "net_proxy" -j MARK --set-xmark 0x1000/0x3000 || return 1
+    iptables -t mangle -C OUTPUT -m cgroup --path "net_direct" -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+        iptables -t mangle -A OUTPUT -m cgroup --path "net_direct" -j MARK --set-xmark 0x2000/0x3000 || return 1
 
-    ip6tables -t mangle -C OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || \
-        ip6tables -t mangle -A OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || true
-    ip6tables -t mangle -C OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || \
-        ip6tables -t mangle -A OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || true
+    ip6tables -t mangle -C OUTPUT -m cgroup --path "net_proxy" -j MARK --set-xmark 0x1000/0x3000 2>/dev/null || \
+        ip6tables -t mangle -A OUTPUT -m cgroup --path "net_proxy" -j MARK --set-xmark 0x1000/0x3000 2>/dev/null || true
+    ip6tables -t mangle -C OUTPUT -m cgroup --path "net_direct" -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+        ip6tables -t mangle -A OUTPUT -m cgroup --path "net_direct" -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
 
-    # 2. ip rule policy routing
-    ip rule add fwmark 0x1000/0x1000 table 100 priority 50 2>/dev/null || true
-    ip rule add fwmark 0x2000/0x2000 table 200 priority 50 2>/dev/null || true
+    # Les priorités restent après les règles usuelles des VPN ; elles ne les remplacent pas.
+    ensure_policy_rule 0x1000/0x1000 100 10040 || return 1
+    ensure_policy_rule 0x2000/0x2000 200 10050 || return 1
 
     # 3. routing table 100 -> proxy tun
-    ip route replace default dev "${TUN_NAME}" table 100 2>/dev/null || true
+    ip route replace default dev "${TUN_NAME}" table 100 || return 1
 
-    # 4. routing table 200 -> direct physical gateway & non-TUN routes
-    if [ -n "$default_gw" ] && [ -n "$default_if" ]; then
-        if [ -n "$default_ip" ]; then
-            ip route replace default via "$default_gw" dev "$default_if" src "$default_ip" table 200 2>/dev/null || true
-        else
-            ip route replace default via "$default_gw" dev "$default_if" table 200 2>/dev/null || true
-        fi
-    elif [ -n "$default_if" ]; then
-        ip route replace default dev "$default_if" table 200 2>/dev/null || true
+    # Copier les routes physiques avant d'installer la passerelle de la table 200.
+    if [ -n "$default_if" ]; then
+        while IFS= read -r route; do
+            [[ "$route" == default* ]] && continue
+            read -r -a route_args <<< "$route"
+            ip route replace "${route_args[@]}" table 200 || return 1
+        done < <(ip -4 route show dev "$default_if")
     fi
-    # Copy existing subnets and direct routes to table 200 (LAN subnets, local interfaces)
-    ip -4 route show 2>/dev/null | grep -v "${TUN_NAME}" | grep -v "0.0.0.0/1" | grep -v "128.0.0.0/1" | while read -r r; do
-        ip route replace $r table 200 2>/dev/null || true
-    done
+    if [ -n "$default_gw" ] && [ -n "$default_if" ]; then
+        local source_args=()
+        [ -n "$default_ip" ] && source_args=(src "$default_ip")
+        ip route replace default via "$default_gw" dev "$default_if" "${source_args[@]}" table 200 || return 1
+    elif [ -n "$default_if" ]; then
+        ip route replace default dev "$default_if" table 200 || return 1
+    else
+        return 1
+    fi
 
     # 5. FTP Traffic Exemption (Bypass FTP)
     if [ "$(read_bypass_ftp)" = "1" ]; then
-        # Load netfilter FTP conntrack helper
         modprobe nf_conntrack_ftp 2>/dev/null || true
 
-        # Raw CT helper for FTP control traffic (ports 21, 990)
         iptables -t raw -C OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || \
             iptables -t raw -A OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
         ip6tables -t raw -C OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || \
             ip6tables -t raw -A OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
 
-        # Mangle FTP bypass rules: mark with 0x2000 (direct table 200)
-        iptables -t mangle -C OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || \
-            iptables -t mangle -A OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000
-        iptables -t mangle -C OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || \
-            iptables -t mangle -A OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000
-        iptables -t mangle -C OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || \
-            iptables -t mangle -A OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000
-        iptables -t mangle -C OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || \
-            iptables -t mangle -A OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-mark 0x2000
+        # Marque 0x2000/0x2000 pour que le trafic FTP soit acheminé via la table 200
+        iptables -t mangle -C OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000
+        iptables -t mangle -C OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000
+        iptables -t mangle -C OUTPUT -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000
+        iptables -t mangle -C OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+            iptables -t mangle -A OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000
 
-        ip6tables -t mangle -C OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || \
-            ip6tables -t mangle -A OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-        ip6tables -t mangle -C OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || \
-            ip6tables -t mangle -A OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-        ip6tables -t mangle -C OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || \
-            ip6tables -t mangle -A OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
-
-        # IP policy rules for FTP socket routing (priority 40, before priority 50)
-        ip rule add ipproto tcp dport 21 table 200 priority 40 2>/dev/null || true
-        ip rule add ipproto tcp dport 990 table 200 priority 40 2>/dev/null || true
-        ip rule add ipproto tcp dport 20 table 200 priority 40 2>/dev/null || true
-        ip rule add ipproto tcp sport 20 table 200 priority 40 2>/dev/null || true
-        ip rule add ipproto tcp dport 989 table 200 priority 40 2>/dev/null || true
-        ip rule add ipproto tcp sport 989 table 200 priority 40 2>/dev/null || true
+        ip6tables -t mangle -C OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+            ip6tables -t mangle -A OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
+        ip6tables -t mangle -C OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+            ip6tables -t mangle -A OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
+        ip6tables -t mangle -C OUTPUT -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || \
+            ip6tables -t mangle -A OUTPUT -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
     fi
 
-    # 6. Masquerade on physical interface so rerouted direct packets have correct source IP
+    # 6. Masquerade uniquement si routage direct actif
     if [ -n "$default_if" ]; then
-        iptables -t nat -C POSTROUTING -o "$default_if" -j MASQUERADE 2>/dev/null || \
-            iptables -t nat -A POSTROUTING -o "$default_if" -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -C POSTROUTING -o "$default_if" -m mark --mark 0x2000/0x2000 -m comment --comment netpulse -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -A POSTROUTING -o "$default_if" -m mark --mark 0x2000/0x2000 -m comment --comment netpulse -j MASQUERADE 2>/dev/null || true
     fi
 }
 
 split_cleanup_rules() {
-    # Move processes out of cgroups
-    target_uid=$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)
     for cg in "$CGROUP_PROXY" "$CGROUP_DIRECT"; do
         if [ -f "$cg/cgroup.procs" ]; then
-            for p in $(cat "$cg/cgroup.procs" 2>/dev/null); do
-                echo "$p" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/app.slice/cgroup.procs" 2>/dev/null || \
-                echo "$p" > "/sys/fs/cgroup/cgroup.procs" 2>/dev/null || true
+            for p in $(cat "$cg/cgroup.procs"); do
+                restore_cgroup "$p" || return 1
             done
         fi
     done
 
-    # Remove iptables mangle rules
-    iptables -t mangle -D OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || true
-    ip6tables -t mangle -D OUTPUT -m cgroup --path "net_proxy" -j MARK --set-mark 0x1000 2>/dev/null || true
-    ip6tables -t mangle -D OUTPUT -m cgroup --path "net_direct" -j MARK --set-mark 0x2000 2>/dev/null || true
+    # Retrait des règles iptables mangle NetPulse (avec et sans masque pour nettoyer tout résidu)
+    for _mask in "0x1000/0x3000" "0x1000/0x1000" "0x1000/0xffffffff" "0x1000"; do
+        iptables -t mangle -D OUTPUT -m cgroup --path "net_proxy" -j MARK --set-xmark "$_mask" 2>/dev/null || true
+        ip6tables -t mangle -D OUTPUT -m cgroup --path "net_proxy" -j MARK --set-xmark "$_mask" 2>/dev/null || true
+    done
+    for _mask in "0x2000/0x3000" "0x2000/0x2000" "0x2000/0xffffffff" "0x2000"; do
+        iptables -t mangle -D OUTPUT -m cgroup --path "net_direct" -j MARK --set-xmark "$_mask" 2>/dev/null || true
+        ip6tables -t mangle -D OUTPUT -m cgroup --path "net_direct" -j MARK --set-xmark "$_mask" 2>/dev/null || true
+    done
 
-    # Remove FTP bypass rules
+    # Retrait des règles FTP bypass
     iptables -t raw -D OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
     ip6tables -t raw -D OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+    for _mask in "0x2000/0x3000" "0x2000/0x2000" "0x2000/0xffffffff" "0x2000"; do
+        iptables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-xmark "$_mask" 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-xmark "$_mask" 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-xmark "$_mask" 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-xmark "$_mask" 2>/dev/null || true
+        ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-xmark "$_mask" 2>/dev/null || true
+        ip6tables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-xmark "$_mask" 2>/dev/null || true
+        ip6tables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-xmark "$_mask" 2>/dev/null || true
+    done
 
-    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-    ip6tables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
-
-    # Remove FTP ip rules
-    ip rule del ipproto tcp dport 21 table 200 priority 40 2>/dev/null || true
-    ip rule del ipproto tcp dport 990 table 200 priority 40 2>/dev/null || true
-    ip rule del ipproto tcp dport 20 table 200 priority 40 2>/dev/null || true
-    ip rule del ipproto tcp sport 20 table 200 priority 40 2>/dev/null || true
-    ip rule del ipproto tcp dport 989 table 200 priority 40 2>/dev/null || true
-    ip rule del ipproto tcp sport 989 table 200 priority 40 2>/dev/null || true
-
-    # Remove routing rules & tables
+    # Nettoyage de toutes les ip rules NetPulse (anciennes et nouvelles priorités)
+    ip rule del fwmark 0x1000/0x1000 table 100 priority 10040 2>/dev/null || true
+    ip rule del fwmark 0x2000/0x2000 table 200 priority 10050 2>/dev/null || true
     ip rule del fwmark 0x1000/0x1000 table 100 priority 50 2>/dev/null || true
     ip rule del fwmark 0x2000/0x2000 table 200 priority 50 2>/dev/null || true
+    ip rule del not fwmark 0/0xffffffff table 200 priority 55 2>/dev/null || true
+
+    for _p in 40; do
+        ip rule del ipproto tcp dport 21 table 200 priority $_p 2>/dev/null || true
+        ip rule del ipproto tcp dport 990 table 200 priority $_p 2>/dev/null || true
+        ip rule del ipproto tcp dport 20 table 200 priority $_p 2>/dev/null || true
+        ip rule del ipproto tcp sport 20 table 200 priority $_p 2>/dev/null || true
+        ip rule del ipproto tcp dport 989 table 200 priority $_p 2>/dev/null || true
+        ip rule del ipproto tcp sport 989 table 200 priority $_p 2>/dev/null || true
+    done
+
     ip route flush table 100 2>/dev/null || true
     ip route flush table 200 2>/dev/null || true
 
-    # Remove masquerade rule
     get_net_info
     if [ -n "$default_if" ]; then
-        iptables -t nat -D POSTROUTING -o "$default_if" -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -o "$default_if" -m mark --mark 0x2000/0x2000 -m comment --comment netpulse -j MASQUERADE 2>/dev/null || true
     fi
+}
+
+remember_cgroup() {
+    local pid="$1" current
+    current=$(awk -F: '$1 == "0" {print $3}' "/proc/$pid/cgroup") || return 1
+    case "$current" in /net_proxy|/net_direct|/net_blocked) return 0 ;; esac
+    install -d -m 700 "$ORIGINAL_CGROUP_DIR" || return 1
+    printf '%s\n' "$current" > "$ORIGINAL_CGROUP_DIR/$pid"
+}
+
+restore_cgroup() {
+    local pid="$1" original="" target_uid
+    if [ ! -d "/proc/$pid" ]; then
+        rm -f "$ORIGINAL_CGROUP_DIR/$pid"
+        return 0
+    fi
+    if [ -f "$ORIGINAL_CGROUP_DIR/$pid" ]; then
+        original=$(cat "$ORIGINAL_CGROUP_DIR/$pid")
+    fi
+    if [ -n "$original" ] && [ -d "/sys/fs/cgroup$original" ]; then
+        printf '%s\n' "$pid" > "/sys/fs/cgroup$original/cgroup.procs" || return 1
+    else
+        target_uid=$(stat -c %u "/proc/$pid") || return 1
+        # Les tranches systemd intermédiaires contiennent des contrôleurs et refusent les processus.
+        local fallback="/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/app.slice"
+        [ -d "$fallback" ] || fallback="/sys/fs/cgroup"
+        mkdir -p "$fallback/netpulse-restored" || return 1
+        printf '%s\n' "$pid" > "$fallback/netpulse-restored/cgroup.procs" || return 1
+    fi
+    rm -f "$ORIGINAL_CGROUP_DIR/$pid"
 }
 
 split_assign_pid() {
-    local target_pid="$1"
-    local destination="$2" # proxy, direct, default
-    [ -z "$target_pid" ] || [ ! -d "/proc/$target_pid" ] && return 1
-
-    target_uid=$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)
+    local target_pid="$1" destination="$2" current target
+    [[ "$target_pid" =~ ^[1-9][0-9]*$ ]] && [ -d "/proc/$target_pid" ] || return 1
+    current=$(awk -F: '$1 == "0" {print $3}' "/proc/$target_pid/cgroup")
+    # Le routage ne doit jamais retirer un processus du pare-feu.
+    [ "$current" = "/net_blocked" ] && return 0
     case "$destination" in
-        proxy)
-            mkdir -p "$CGROUP_PROXY"
-            echo "$target_pid" > "$CGROUP_PROXY/cgroup.procs" 2>/dev/null || true
-            ;;
-        direct)
-            mkdir -p "$CGROUP_DIRECT"
-            echo "$target_pid" > "$CGROUP_DIRECT/cgroup.procs" 2>/dev/null || true
-            ;;
+        proxy) target="$CGROUP_PROXY" ;;
+        direct) target="$CGROUP_DIRECT" ;;
         default)
-            echo "$target_pid" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/app.slice/cgroup.procs" 2>/dev/null || \
-            echo "$target_pid" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/cgroup.procs" 2>/dev/null || \
-            echo "$target_pid" > "/sys/fs/cgroup/cgroup.procs" 2>/dev/null || true
+            case "$current" in /net_proxy|/net_direct) restore_cgroup "$target_pid" ;; *) return 0 ;; esac
+            return $?
             ;;
+        *) echo "Destination de routage invalide : $destination" >&2; return 1 ;;
     esac
+    [ "$current" = "${target#/sys/fs/cgroup}" ] && return 0
+    remember_cgroup "$target_pid" || return 1
+    mkdir -p "$target" || return 1
+    printf '%s\n' "$target_pid" > "$target/cgroup.procs"
 }
 
 split_sync() {
-    local mode
+    local mode bypass_ftp pid app destination
     mode=$(read_split_mode)
-    local bypass_ftp
     bypass_ftp=$(read_bypass_ftp)
-
-    # Function to ensure FTP applications are routed direct
-    sync_ftp_apps() {
-        if [ "$bypass_ftp" = "1" ]; then
-            local ftp_apps=("filezilla" "lftp" "ftp" "ncftp" "gvfsd-ftp" "kio_ftp" "cyberduck" "tftp" "vsftpd" "proftpd" "pure-ftpd")
-            for fapp in "${ftp_apps[@]}"; do
-                local fpids
-                fpids=$(pgrep -i "$fapp" 2>/dev/null || true)
-                for p in $fpids; do
-                    [ -d "/proc/$p" ] && split_assign_pid "$p" "direct"
-                done
-            done
-        fi
-    }
-
-    # If mode is disabled, empty proxy cgroup, keep only FTP apps in direct cgroup
-    if [ "$mode" = "disabled" ]; then
-        if [ -f "$CGROUP_PROXY/cgroup.procs" ]; then
-            for p in $(cat "$CGROUP_PROXY/cgroup.procs" 2>/dev/null); do
-                split_assign_pid "$p" "default"
-            done
-        fi
-        if [ "$bypass_ftp" != "1" ]; then
-            if [ -f "$CGROUP_DIRECT/cgroup.procs" ]; then
-                for p in $(cat "$CGROUP_DIRECT/cgroup.procs" 2>/dev/null); do
-                    split_assign_pid "$p" "default"
-                done
-            fi
-        else
-            sync_ftp_apps
-        fi
-        return 0
-    fi
-
-    # Read configured split apps
-    local apps=()
-    if [ -f "$SPLIT_FILE" ]; then
-        while IFS= read -r line; do
-            line=$(echo "$line" | tr -d '\r\n' | tr '[:upper:]' '[:lower:]' | xargs)
-            [ -n "$line" ] && apps+=("$line")
+    local -A destinations=()
+    if [ "$mode" != "disabled" ] && [ -f "$SPLIT_FILE" ]; then
+        while IFS= read -r app || [ -n "$app" ]; do
+            app=$(normalize_app_name "$app") || continue
+            while IFS= read -r pid; do
+                [ -n "$pid" ] || continue
+                if [ "$mode" = "include" ]; then destinations[$pid]=proxy; else destinations[$pid]=direct; fi
+            done < <(find_app_pids "$app")
         done < "$SPLIT_FILE"
     fi
-
-    # If mode is include:
-    if [ "$mode" = "include" ]; then
-        # Empty net_direct
-        if [ -f "$CGROUP_DIRECT/cgroup.procs" ]; then
-            for p in $(cat "$CGROUP_DIRECT/cgroup.procs" 2>/dev/null); do
-                split_assign_pid "$p" "default"
-            done
-        fi
-        # Find all PIDs matching any split app and assign to proxy
-        for app in "${apps[@]}"; do
-            pids=$(pgrep -i "$app" 2>/dev/null || true)
-            for p in $pids; do
-                [ -d "/proc/$p" ] && split_assign_pid "$p" "proxy"
-            done
+    if [ "$bypass_ftp" = "1" ]; then
+        for app in filezilla lftp ftp ncftp gvfsd-ftp kio_ftp cyberduck tftp vsftpd proftpd pure-ftpd; do
+            while IFS= read -r pid; do
+                [ -n "$pid" ] && destinations[$pid]=direct
+            done < <(find_app_pids "$app")
         done
-        sync_ftp_apps
     fi
-
-    # If mode is exclude:
-    if [ "$mode" = "exclude" ]; then
-        # Empty net_proxy
-        if [ -f "$CGROUP_PROXY/cgroup.procs" ]; then
-            for p in $(cat "$CGROUP_PROXY/cgroup.procs" 2>/dev/null); do
-                split_assign_pid "$p" "default"
-            done
+    # Restaurer aussi les applications retirées de la liste, quel que soit le mode.
+    for group in "$CGROUP_PROXY" "$CGROUP_DIRECT"; do
+        [ -f "$group/cgroup.procs" ] || continue
+        while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            destination=${destinations[$pid]:-default}
+            if ! split_assign_pid "$pid" "$destination"; then
+                [ -d "/proc/$pid" ] && return 1
+            fi
+            unset 'destinations[$pid]'
+        done < "$group/cgroup.procs"
+    done
+    for pid in "${!destinations[@]}"; do
+        if ! split_assign_pid "$pid" "${destinations[$pid]}"; then
+            [ -d "/proc/$pid" ] && return 1
         fi
-        # Find all PIDs matching any split app and assign to direct
-        for app in "${apps[@]}"; do
-            pids=$(pgrep -i "$app" 2>/dev/null || true)
-            for p in $pids; do
-                [ -d "/proc/$p" ] && split_assign_pid "$p" "direct"
-            done
-        done
-        sync_ftp_apps
-    fi
+    done
+    return 0
+}
+
+firewall_init() {
+    mkdir -p "$CGROUP_BLOCKED" || return 1
+    iptables -C OUTPUT -m cgroup --path net_blocked -j REJECT 2>/dev/null ||
+        iptables -I OUTPUT -m cgroup --path net_blocked -j REJECT || return 1
+    ip6tables -C OUTPUT -m cgroup --path net_blocked -j REJECT 2>/dev/null ||
+        ip6tables -I OUTPUT -m cgroup --path net_blocked -j REJECT || return 1
+}
+
+kill_pid_sockets() {
+    # ss ne possède pas de filtre pid : sélectionner les sockets puis filtrer leurs extrémités.
+    python3 - "$1" <<'PYSOCKETS'
+import re, subprocess, sys
+pid = int(sys.argv[1])
+result = subprocess.run(["ss", "-Htnp"], capture_output=True, text=True, timeout=3, check=True)
+for line in result.stdout.splitlines():
+    if pid not in {int(value) for value in re.findall(r"pid=(\d+)", line)}:
+        continue
+    fields = line.split()
+    if len(fields) >= 5:
+        subprocess.run(["ss", "-K", "-t", "src", fields[3], "dst", fields[4]],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=True)
+PYSOCKETS
 }
 
 split_set_mode() {
@@ -597,18 +690,18 @@ split_set_mode() {
         return 1
     fi
 
-    save_split_mode "$new_mode"
+    save_split_mode "$new_mode" || return 1
 
     if get_status; then
-        split_setup_rules
+        split_setup_rules || return 1
         if [ "$new_mode" = "include" ]; then
             ip route del 0.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
             ip route del 128.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
         else
-            ip route replace 0.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
-            ip route replace 128.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
+            ip route replace 0.0.0.0/1 dev "${TUN_NAME}" metric 10 || return 1
+            ip route replace 128.0.0.0/1 dev "${TUN_NAME}" metric 10 || return 1
         fi
-        split_sync
+        split_sync || return 1
     fi
     echo "Mode Split Tunneling défini sur : $new_mode"
 }
@@ -625,25 +718,38 @@ case "$1" in
             exit 1
         fi
 
-        # Extract physical gateway & interface, ignoring virtual tun/tap/wireguard interfaces
-        def_line=$(ip -4 route show default | grep -E "dev (wl|en|eth|wlan|lan)" | head -n 1)
-        if [ -z "$def_line" ]; then
-            def_line=$(ip -4 route show | grep -E "dev (wl|en|eth|wlan|lan)" | grep -E "via|default" | head -n 1)
+        if [ ! -x "$TUN2SOCKS_BIN" ]; then
+            echo "Erreur: Binaire tun2socks introuvable à $TUN2SOCKS_BIN" >&2
+            exit 1
         fi
-        if [ -z "$def_line" ]; then
-            def_line=$(ip -4 route show default | head -n 1)
+        get_net_info
+        if [ -z "$default_if" ]; then
+            echo "Erreur: Aucune interface réseau disponible." >&2
+            exit 1
         fi
-        default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
-        default_gw=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
-        if [ -z "$default_gw" ] && [ -n "$default_if" ]; then
-            default_gw=$(ip -4 route show dev "$default_if" 2>/dev/null | awk '/default via/ {print $3}' | head -n 1)
-        fi
-        proxy_ip=$(echo "$proxy_arg" | sed -E 's|.*://([^:/]+).*|\1|')
+        proxy_ip=$(python3 - "$proxy_arg" <<'PYPROXY'
+import socket, sys
+from urllib.parse import urlsplit
+try:
+    proxy = urlsplit(sys.argv[1])
+    if proxy.scheme not in ("socks5", "socks4", "http") or not proxy.hostname or not proxy.port:
+        raise ValueError("URL attendue : socks5://hôte:port, socks4://hôte:port ou http://hôte:port")
+    print(socket.getaddrinfo(proxy.hostname, proxy.port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0])
+except (OSError, ValueError) as exc:
+    print(f"Erreur de proxy : {exc}", file=sys.stderr)
+    sys.exit(1)
+PYPROXY
+        ) || exit 1
+
+        install -d -o root -g root -m 755 /run/netpulse || exit 1
 
         echo "Configuration du proxy forcé..."
         echo "Proxy: $proxy_arg"
         echo "Interface réseau physique: $default_if (GW: $default_gw)"
 
+        if get_status; then
+            "$REAL_SCRIPT" stop || exit 1
+        fi
         # 1. Clean previous state completely
         pkill -9 -f "tun2socks.*${TUN_NAME}" 2>/dev/null || true
         sleep 0.3
@@ -651,19 +757,21 @@ case "$1" in
         ip tuntap del dev "${TUN_NAME}" mode tun 2>/dev/null || true
 
         # 2. Add explicit route to proxy server via physical gateway to avoid routing loops
-        if [ -n "$default_gw" ] && [ -n "$default_if" ] && [ -n "$proxy_ip" ]; then
-            ip route replace "$proxy_ip" via "$default_gw" dev "$default_if" metric 5 2>/dev/null || true
+        if [ -n "$default_gw" ] && [ -n "$default_if" ] && [ -n "$proxy_ip" ] && [ "$proxy_ip" != "$default_gw" ] && [[ "$proxy_ip" != 127.* ]] && [ "$proxy_ip" != "localhost" ]; then
+            install -d -o root -g root -m 755 /run/netpulse || exit 1
+            ip route add "$proxy_ip/32" via "$default_gw" dev "$default_if" metric 5 || exit 1
+            printf '%s %s %s\n' "$proxy_ip" "$default_gw" "$default_if" > "$PROXY_ROUTE_FILE"
         fi
 
         # 3. Create TUN interface with optimized MTU for mobile hotspot / VPN encapsulation
         # MTU 1400 prevents packet fragmentation on WireGuard/OpenVPN phone tunnels
-        ip tuntap add dev "${TUN_NAME}" mode tun 2>/dev/null || true
-        ip addr add 198.18.0.1/15 dev "${TUN_NAME}" 2>/dev/null || true
-        ip link set dev "${TUN_NAME}" mtu 1400 up
+        ip tuntap add dev "${TUN_NAME}" mode tun || { "$REAL_SCRIPT" stop; exit 1; }
+        ip addr add 198.18.0.1/15 dev "${TUN_NAME}" || { "$REAL_SCRIPT" stop; exit 1; }
+        ip link set dev "${TUN_NAME}" mtu 1400 up || { "$REAL_SCRIPT" stop; exit 1; }
 
         # Apply TCP MSS clamping to prevent PMTU blackholes
-        iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-        iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -C POSTROUTING -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A POSTROUTING -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -C OUTPUT -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A OUTPUT -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
         # Optimize kernel TCP stack for proxy throughput and mobile network jitter
         sysctl -q -w net.ipv4.tcp_mtu_probing=1 2>/dev/null || true
@@ -674,11 +782,8 @@ case "$1" in
         sysctl -q -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true
         sysctl -q -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
 
-        # Configure DNS: Route DNS queries to the phone hotspot gateway for 40ms resolution
-        if [ -n "$default_gw" ] && [ -n "$default_if" ]; then
-            resolvectl dns "$default_if" "$default_gw" 2>/dev/null || true
-            resolvectl default-route "$default_if" yes 2>/dev/null || true
-        fi
+        # DNS : on ne modifie plus systemd-resolved (le DNS DHCP/VPN reste intact).
+        # Les requêtes DNS transitent déjà par le TUN comme tout le trafic.
 
         # 4. Start tun2socks with high-throughput auto-tuning & large netstack buffers
         if [ ! -x "$TUN2SOCKS_BIN" ]; then
@@ -698,27 +803,37 @@ case "$1" in
             --loglevel info > "$LOG_FILE" 2>&1 &
         echo $! > "$PID_FILE"
         echo "$proxy_arg" > "$STATE_FILE"
+        chgrp "$(id -gn "$TARGET_USER")" "$STATE_FILE" || exit 1
+        chmod 640 "$STATE_FILE"
+        chmod 600 "$LOG_FILE"
 
         # Wait a moment for interface initialization
         sleep 0.5
 
+        if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            echo "Erreur: tun2socks n'a pas démarré. Consultez $LOG_FILE." >&2
+            "$REAL_SCRIPT" stop >/dev/null 2>&1
+            exit 1
+        fi
+
         # 5. Route IPv4 traffic according to Split Tunneling mode
-        split_setup_rules
+        split_setup_rules || { "$REAL_SCRIPT" stop; exit 1; }
         split_mode=$(read_split_mode)
 
         if [ "$split_mode" != "include" ]; then
-            ip route replace 0.0.0.0/1 dev "${TUN_NAME}" metric 10
-            ip route replace 128.0.0.0/1 dev "${TUN_NAME}" metric 10
+            ip route replace 0.0.0.0/1 dev "${TUN_NAME}" metric 10 || { "$REAL_SCRIPT" stop; exit 1; }
+            ip route replace 128.0.0.0/1 dev "${TUN_NAME}" metric 10 || { "$REAL_SCRIPT" stop; exit 1; }
         else
             ip route del 0.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
             ip route del 128.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
         fi
 
-        split_sync
+        split_sync || { "$REAL_SCRIPT" stop; exit 1; }
 
         # 6. Propagate environment variables into user systemd session (HTTP/HTTPS only, NO all_proxy to preserve FTP!)
-        sudo -u "$TARGET_USER" systemctl --user set-environment http_proxy="$proxy_arg" https_proxy="$proxy_arg" 2>/dev/null || true
-        sudo -u "$TARGET_USER" systemctl --user unset-environment all_proxy ALL_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
+        # Le TUN force déjà tout le trafic : on n'exporte plus http(s)_proxy (une URL socks5:// dans ces
+        # variables fait échouer Proton VPN, requests, pip...). On nettoie d'anciennes valeurs éventuelles.
+        sudo -u "$TARGET_USER" systemctl --user unset-environment http_proxy https_proxy all_proxy ALL_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
 
         # Configure snap daemon proxy if HTTP proxy is used
         if echo "$proxy_arg" | grep -qE '^https?://'; then
@@ -733,53 +848,44 @@ case "$1" in
     stop)
         echo "Désactivation du forçage proxy..."
 
-        # Clean up Split Tunneling rules, tables and cgroups
-        split_cleanup_rules
-
-        # Read previous proxy IP to clean route
-        if [ -f "$STATE_FILE" ]; then
-            prev_proxy=$(cat "$STATE_FILE")
-            prev_ip=$(echo "$prev_proxy" | sed -E 's|.*://([^:/]+).*|\1|')
-            def_line=$(ip -4 route show default | grep -E "dev (wl|en|eth|wlan|lan)" | head -n 1)
-            [ -z "$def_line" ] && def_line=$(ip -4 route show | grep -E "dev (wl|en|eth|wlan|lan)" | grep -E "via|default" | head -n 1)
-            [ -z "$def_line" ] && def_line=$(ip -4 route show default | head -n 1)
-            default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
-            default_gw=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
-            if [ -z "$default_gw" ] && [ -n "$default_if" ]; then
-                default_gw=$(ip -4 route show dev "$default_if" 2>/dev/null | awk '/default via/ {print $3}' | head -n 1)
-            fi
-            if [ -n "$default_gw" ] && [ -n "$default_if" ] && [ -n "$prev_ip" ]; then
-                ip route del "$prev_ip" via "$default_gw" dev "$default_if" metric 5 2>/dev/null || true
-            fi
-        fi
-
-        # Remove TUN routes
+        # 1. Supprimer immédiatement les routes TUN 0.0.0.0/1 et 128.0.0.0/1
+        # C'est la priorité absolue : le trafic repasse instantanément sur la route par défaut (WiFi/Ethernet/VPN) SANS AUCUNE COUPURE
         ip route del 0.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
         ip route del 128.0.0.0/1 dev "${TUN_NAME}" metric 10 2>/dev/null || true
 
-        # Kill tun2socks
+        # Retirer uniquement la route créée par cette instance (y compris hôtes DNS et authentification).
+        if [ -f "$PROXY_ROUTE_FILE" ]; then
+            read -r prev_ip prev_gateway prev_interface < "$PROXY_ROUTE_FILE"
+            ip route del "$prev_ip/32" via "$prev_gateway" dev "$prev_interface" metric 5 2>/dev/null || true
+            rm -f "$PROXY_ROUTE_FILE"
+        fi
+
+        # 3. Arrêter tun2socks
         pkill -9 -f "tun2socks.*${TUN_NAME}" 2>/dev/null || true
         rm -f "$PID_FILE" "$STATE_FILE"
 
-        # Remove TCP MSS clamping
-        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-        iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-
-        # Revert DNS to default DHCP
-        def_line=$(ip -4 route show default | head -n 1)
-        default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
-        if [ -n "$default_if" ]; then
-            resolvectl revert "$default_if" 2>/dev/null || true
-        fi
-
-        # Remove TUN device
+        # 4. Supprimer l'interface TUN
         ip link set dev "${TUN_NAME}" down 2>/dev/null || true
         ip tuntap del dev "${TUN_NAME}" mode tun 2>/dev/null || true
 
-        # Unset user environment
-        sudo -u "$TARGET_USER" systemctl --user unset-environment http_proxy https_proxy all_proxy ALL_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
+        # 5. Nettoyer les règles de Split Tunneling, tables de routage 100/200 et cgroups
+        split_cleanup_rules || exit 1
 
-        
+        # 6. Retirer le MSS clamping
+        iptables -t mangle -D POSTROUTING -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+        # 7. DNS : Ne JAMAIS exécuter "resolvectl revert" (qui vide le Link DNS et coupe la connexion !)
+        # Au besoin, si le DNS de l'interface physique est vide, réappliquer la configuration NetworkManager
+        get_net_info
+        if [ -n "$default_if" ] && command -v nmcli >/dev/null 2>&1; then
+            if ! resolvectl dns "$default_if" 2>/dev/null | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:'; then
+                nmcli device reapply "$default_if" 2>/dev/null || true
+            fi
+        fi
+
+        # 8. Nettoyage strict des variables d'environnement de session (garantit que Proton VPN n'est pas pollué)
+        sudo -u "$TARGET_USER" systemctl --user unset-environment http_proxy https_proxy all_proxy ALL_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
         snap unset system proxy.http proxy.https 2>/dev/null || true
 
         echo "Succès: Forçage proxy désactivé. Le routage standard est restauré."
@@ -798,8 +904,8 @@ case "$1" in
         fi
 
         # 2. MSS clamping
-        iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-        iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -C POSTROUTING -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A POSTROUTING -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -C OUTPUT -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A OUTPUT -o "$TUN_NAME" -p tcp --tcp-flags SYN,RST SYN -m comment --comment netpulse -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
         # 3. Kernel TCP optimizations
         sysctl -q -w net.ipv4.tcp_mtu_probing=1 2>/dev/null || true
@@ -810,11 +916,7 @@ case "$1" in
         sysctl -q -w net.ipv4.tcp_window_scaling=1 2>/dev/null || true
         sysctl -q -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
 
-        # 4. Direct DNS via phone gateway
-        if [ -n "$default_gw" ] && [ -n "$default_if" ]; then
-            resolvectl dns "$default_if" "$default_gw" 2>/dev/null || true
-            resolvectl default-route "$default_if" yes 2>/dev/null || true
-        fi
+        # 4. DNS : laissé tel quel (géré par NetworkManager / VPN)
 
         # 5. Hot-reload tun2socks seamlessly if running
         if [ -f "$STATE_FILE" ] && ip link show "${TUN_NAME}" >/dev/null 2>&1; then
@@ -839,60 +941,42 @@ case "$1" in
 
     block)
         target_pid="$2"
-        if [ -n "$target_pid" ] && [ -d "/proc/$target_pid" ]; then
-            mkdir -p /sys/fs/cgroup/net_blocked
-            mkdir -p /tmp/net_blocked_orig_cg
-            orig_cg=$(cat /proc/$target_pid/cgroup 2>/dev/null | head -n 1 | cut -d: -f3)
-            if [ -n "$orig_cg" ] && [ "$orig_cg" != "/net_blocked" ]; then
-                echo "$orig_cg" > "/tmp/net_blocked_orig_cg/$target_pid"
-            fi
-            echo "$target_pid" > /sys/fs/cgroup/net_blocked/cgroup.procs 2>/dev/null || true
-            if command -v ss >/dev/null 2>&1; then
-                ss -K -p "pid=$target_pid" 2>/dev/null || true
-            fi
-            echo "PID $target_pid bloqué avec succès."
-            exit 0
-        fi
-        exit 1
+        [[ "$target_pid" =~ ^[1-9][0-9]*$ ]] && [ -d "/proc/$target_pid" ] || exit 1
+        firewall_init || exit 1
+        remember_cgroup "$target_pid" || exit 1
+        printf '%s\n' "$target_pid" > "$CGROUP_BLOCKED/cgroup.procs" || exit 1
+        kill_pid_sockets "$target_pid" || exit 1
+        echo "PID $target_pid bloqué avec succès."
+        exit 0
         ;;
 
     unblock)
         target_pid="$2"
-        if [ -n "$target_pid" ] && [ -d "/proc/$target_pid" ]; then
-            orig_cg=""
-            if [ -f "/tmp/net_blocked_orig_cg/$target_pid" ]; then
-                orig_cg=$(cat "/tmp/net_blocked_orig_cg/$target_pid")
-                rm -f "/tmp/net_blocked_orig_cg/$target_pid"
-            fi
-            target_uid=$(id -u "$TARGET_USER" 2>/dev/null || echo 1000)
-            if [ -n "$orig_cg" ] && [ -d "/sys/fs/cgroup$orig_cg" ]; then
-                echo "$target_pid" > "/sys/fs/cgroup$orig_cg/cgroup.procs" 2>/dev/null || true
-            else
-                echo "$target_pid" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/app.slice/cgroup.procs" 2>/dev/null || \
-                echo "$target_pid" > "/sys/fs/cgroup/user.slice/user-${target_uid}.slice/user@${target_uid}.service/cgroup.procs" 2>/dev/null || true
-            fi
-            echo "PID $target_pid débloqué avec succès."
-            exit 0
+        [[ "$target_pid" =~ ^[1-9][0-9]*$ ]] && [ -d "/proc/$target_pid" ] || exit 1
+        current=$(awk -F: '$1 == "0" {print $3}' "/proc/$target_pid/cgroup")
+        if [ "$current" = "/net_blocked" ]; then
+            restore_cgroup "$target_pid" || exit 1
         fi
-        exit 1
+        echo "PID $target_pid débloqué avec succès."
+        exit 0
         ;;
 
-
     block-app)
-        app_name="$2"
+        app_name="$(normalize_app_name "$2")" || exit 1
         if [ -n "$app_name" ]; then
-            BLOCKED_DIR="/home/$TARGET_USER/.config/force-proxy"
+            firewall_init || exit 1
+            BLOCKED_DIR="$TARGET_HOME/.config/force-proxy"
             mkdir -p "$BLOCKED_DIR"
             BLOCKED_FILE="$BLOCKED_DIR/blocked_apps.txt"
             touch "$BLOCKED_FILE"
-            if ! grep -Fxq "$app_name" "$BLOCKED_FILE" 2>/dev/null; then
+            if ! grep -Fxq -- "$app_name" "$BLOCKED_FILE" 2>/dev/null; then
                 echo "$app_name" >> "$BLOCKED_FILE"
             fi
             chown -R "$TARGET_USER:$TARGET_USER" "$BLOCKED_DIR" 2>/dev/null || true
             # Block all running instances matching exact process name
-            pids=$(pgrep -x "$app_name" 2>/dev/null || pgrep "$app_name" 2>/dev/null)
+            pids=$(find_app_pids "$app_name")
             for p in $pids; do
-                "$REAL_SCRIPT" block "$p" >/dev/null 2>&1 || true
+                "$REAL_SCRIPT" block "$p" || exit 1
             done
             echo "Application $app_name bloquée."
             exit 0
@@ -901,16 +985,14 @@ case "$1" in
         ;;
 
     unblock-app)
-        app_name="$2"
+        app_name="$(normalize_app_name "$2")" || exit 1
         if [ -n "$app_name" ]; then
-            BLOCKED_FILE="/home/$TARGET_USER/.config/force-proxy/blocked_apps.txt"
-            if [ -f "$BLOCKED_FILE" ]; then
-                sed -i "/^$app_name$/d" "$BLOCKED_FILE" 2>/dev/null || true
-            fi
+            BLOCKED_FILE="$TARGET_HOME/.config/force-proxy/blocked_apps.txt"
+            remove_exact_line "$BLOCKED_FILE" "$app_name" || exit 1
             # Unblock all running instances matching exact process name
-            pids=$(pgrep -x "$app_name" 2>/dev/null || pgrep "$app_name" 2>/dev/null)
+            pids=$(find_app_pids "$app_name")
             for p in $pids; do
-                "$REAL_SCRIPT" unblock "$p" >/dev/null 2>&1 || true
+                "$REAL_SCRIPT" unblock "$p" || exit 1
             done
             echo "Application $app_name débloquée."
             exit 0
@@ -919,32 +1001,89 @@ case "$1" in
         ;;
 
     firewall-init)
-        mkdir -p /sys/fs/cgroup/net_blocked
-        chown -R "$TARGET_USER:$TARGET_USER" /sys/fs/cgroup/net_blocked 2>/dev/null || true
-        iptables -C OUTPUT -m cgroup --path "net_blocked" -j REJECT 2>/dev/null || iptables -I OUTPUT -m cgroup --path "net_blocked" -j REJECT
-        ip6tables -C OUTPUT -m cgroup --path "net_blocked" -j REJECT 2>/dev/null || ip6tables -I OUTPUT -m cgroup --path "net_blocked" -j REJECT 2>/dev/null || true
+        firewall_init || exit 1
         echo "Pare-feu applicatif initialisé avec succès."
         exit 0
         ;;
 
     firewall-reset)
-        if [ -f /sys/fs/cgroup/net_blocked/cgroup.procs ]; then
-            for p in $(cat /sys/fs/cgroup/net_blocked/cgroup.procs 2>/dev/null); do
-                echo "$p" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+        if [ -f "$CGROUP_BLOCKED/cgroup.procs" ]; then
+            for p in $(cat "$CGROUP_BLOCKED/cgroup.procs"); do
+                restore_cgroup "$p" || exit 1
             done
         fi
-        iptables -D OUTPUT -m cgroup --path "net_blocked" -j REJECT 2>/dev/null || true
-        ip6tables -D OUTPUT -m cgroup --path "net_blocked" -j REJECT 2>/dev/null || true
-        rmdir /sys/fs/cgroup/net_blocked 2>/dev/null || true
+        blocked_file="$SPLIT_DIR/blocked_apps.txt"
+        if [ -f "$blocked_file" ]; then
+            : > "$blocked_file" || exit 1
+        fi
+        iptables -D OUTPUT -m cgroup --path net_blocked -j REJECT 2>/dev/null || true
+        ip6tables -D OUTPUT -m cgroup --path net_blocked -j REJECT 2>/dev/null || true
+        rmdir "$CGROUP_BLOCKED" 2>/dev/null || true
         echo "Règles de pare-feu réinitialisées."
         exit 0
         ;;
 
     update-sudoers)
-        echo "$TARGET_USER ALL=(ALL) NOPASSWD: /home/$TARGET_USER/.local/bin/netpulse-ctl, /home/$TARGET_USER/.local/bin/force-proxy-ctl" > /etc/sudoers.d/netpulse
-        echo "$TARGET_USER ALL=(ALL) NOPASSWD: /home/$TARGET_USER/.local/bin/netpulse-ctl, /home/$TARGET_USER/.local/bin/force-proxy-ctl" > /etc/sudoers.d/force-proxy
-        chmod 440 /etc/sudoers.d/netpulse /etc/sudoers.d/force-proxy 2>/dev/null || true
+        # sudo ne doit autoriser qu'un script installé appartenant à root.
+        if [ "$REAL_SCRIPT" != "$ROOT_CTL" ] || [ "$(stat -c %u "$ROOT_CTL")" != "0" ]; then
+            echo "Erreur: Installez d'abord le contrôleur root avec ./install.sh." >&2
+            exit 1
+        fi
+        sudoers_tmp=$(mktemp) || exit 1
+        printf '%s ALL=(root) NOPASSWD: %s\n' "$TARGET_USER" "$ROOT_CTL" > "$sudoers_tmp"
+        if ! visudo -cf "$sudoers_tmp"; then
+            rm -f "$sudoers_tmp"
+            exit 1
+        fi
+        install -o root -g root -m 440 "$sudoers_tmp" /etc/sudoers.d/netpulse || exit 1
+        rm -f "$sudoers_tmp" /etc/sudoers.d/force-proxy
         echo "Configuration sudoers mise à jour avec succès."
+        exit 0
+        ;;
+
+    install-runtime)
+        # Installation de fichiers uniquement : ne lance aucune commande de routage ou de pare-feu.
+        install -d -o root -g root -m 755 /usr/local/libexec/netpulse /run/netpulse || exit 1
+        install -o root -g root -m 755 "$REAL_SCRIPT" "$ROOT_CTL.next" || exit 1
+        mv -f "$ROOT_CTL.next" "$ROOT_CTL" || exit 1
+        if [ ! -x "$TUN2SOCKS_BIN" ]; then
+            install -o root -g root -m 755 "$USER_BIN/tun2socks" "$TUN2SOCKS_BIN" || exit 1
+        fi
+        python3 - "$TARGET_USER" <<'PYMIGRATE'
+import os, pwd, stat, sys, tempfile
+account = pwd.getpwnam(sys.argv[1])
+runtime = "/run/netpulse"
+def trusted_read(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"Fichier de migration non sûr : {path}")
+        return stream.read()
+if not os.path.exists(runtime + "/tun2socks.pid") and os.path.exists("/tmp/force-proxy.pid"):
+    pid = int(trusted_read("/tmp/force-proxy.pid").strip())
+    with open(f"/proc/{pid}/comm", encoding="utf-8") as stream:
+        if stream.read().strip() != "tun2socks":
+            raise ValueError("Le PID historique n'appartient pas à tun2socks")
+    proxy = trusted_read("/tmp/force-proxy-current.txt").strip()
+    # Le PID sert de marqueur de migration terminée, publié après le proxy.
+    for name, content, mode in (("proxy.txt", proxy, 0o640), ("tun2socks.pid", str(pid), 0o644)):
+        fd, temporary = tempfile.mkstemp(dir=runtime)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(content + "\n")
+                os.fchmod(stream.fileno(), mode)
+                os.fchown(stream.fileno(), 0, account.pw_gid)
+            os.replace(temporary, runtime + "/" + name)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    print(f"Tunnel existant adopté, PID {pid}, sans redémarrage.")
+else:
+    print("Contrôleur installé ; état du tunnel conservé.")
+PYMIGRATE
+        [ "$?" -eq 0 ] || exit 1
+        "$ROOT_CTL" update-sudoers || exit 1
         exit 0
         ;;
 
@@ -955,20 +1094,20 @@ case "$1" in
             exit 0
         fi
         split_set_mode "$new_mode"
-        exit 0
+        exit $?
         ;;
 
     split-add)
-        app_name="$2"
+        app_name="$(normalize_app_name "$2")" || exit 1
         if [ -n "$app_name" ]; then
             mkdir -p "$SPLIT_DIR"
             touch "$SPLIT_FILE"
-            app_lower=$(echo "$app_name" | tr '[:upper:]' '[:lower:]' | xargs)
-            if ! grep -Fxq "$app_lower" "$SPLIT_FILE" 2>/dev/null; then
+            app_lower="$app_name"
+            if ! grep -Fxq -- "$app_lower" "$SPLIT_FILE" 2>/dev/null; then
                 echo "$app_lower" >> "$SPLIT_FILE"
             fi
             chown -R "$TARGET_USER:$TARGET_USER" "$SPLIT_DIR" 2>/dev/null || true
-            split_sync
+            if get_status; then split_sync || exit 1; fi
             echo "Application '$app_lower' ajoutée au Split Tunneling."
             exit 0
         fi
@@ -977,13 +1116,11 @@ case "$1" in
         ;;
 
     split-del)
-        app_name="$2"
+        app_name="$(normalize_app_name "$2")" || exit 1
         if [ -n "$app_name" ]; then
-            app_lower=$(echo "$app_name" | tr '[:upper:]' '[:lower:]' | xargs)
-            if [ -f "$SPLIT_FILE" ]; then
-                sed -i "/^$app_lower$/d" "$SPLIT_FILE" 2>/dev/null || true
-            fi
-            split_sync
+            app_lower="$app_name"
+            remove_exact_line "$SPLIT_FILE" "$app_lower" || exit 1
+            if get_status; then split_sync || exit 1; fi
             echo "Application '$app_lower' retirée du Split Tunneling."
             exit 0
         fi
@@ -996,14 +1133,14 @@ case "$1" in
         target_dest="$3"
         if [ -n "$target_pid" ] && [ -n "$target_dest" ]; then
             split_assign_pid "$target_pid" "$target_dest"
-            exit 0
+            exit $?
         fi
         echo "Usage: $CMD_NAME split-assign <pid> <proxy|direct|default>" >&2
         exit 1
         ;;
 
     split-sync)
-        split_sync
+        if get_status; then split_sync || exit 1; fi
         echo "Synchronisation du Split Tunneling terminée."
         exit 0
         ;;
@@ -1021,28 +1158,28 @@ case "$1" in
         fi
         case "$action" in
             on|enable|true|1)
-                save_bypass_ftp 1
+                save_bypass_ftp 1 || exit 1
                 if get_status; then
-                    split_setup_rules
-                    split_sync
+                    split_setup_rules || exit 1
+                    if get_status; then split_sync || exit 1; fi
                 fi
                 echo "Contournement FTP activé avec succès."
                 exit 0
                 ;;
             off|disable|false|0)
-                save_bypass_ftp 0
+                save_bypass_ftp 0 || exit 1
                 if get_status; then
                     # Retirer les règles spécifiques FTP
                     iptables -t raw -D OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
                     ip6tables -t raw -D OUTPUT -p tcp -m multiport --dports 21,990 -j CT --helper ftp 2>/dev/null || true
-                    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-                    iptables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-                    iptables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
-                    iptables -t mangle -D OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
+                    iptables -t mangle -D OUTPUT -p tcp -m conntrack --ctstate RELATED -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
 
-                    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-                    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-mark 0x2000 2>/dev/null || true
-                    ip6tables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-mark 0x2000 2>/dev/null || true
+                    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
+                    ip6tables -t mangle -D OUTPUT -p tcp -m multiport --sports 20,21,989,990 -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
+                    ip6tables -t mangle -D OUTPUT -m helper --helper ftp -j MARK --set-xmark 0x2000/0x3000 2>/dev/null || true
 
                     ip rule del ipproto tcp dport 21 table 200 priority 40 2>/dev/null || true
                     ip rule del ipproto tcp dport 990 table 200 priority 40 2>/dev/null || true
@@ -1050,7 +1187,7 @@ case "$1" in
                     ip rule del ipproto tcp sport 20 table 200 priority 40 2>/dev/null || true
                     ip rule del ipproto tcp dport 989 table 200 priority 40 2>/dev/null || true
                     ip rule del ipproto tcp sport 989 table 200 priority 40 2>/dev/null || true
-                    split_sync
+                    if get_status; then split_sync || exit 1; fi
                 fi
                 echo "Contournement FTP désactivé."
                 exit 0
