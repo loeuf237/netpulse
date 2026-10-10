@@ -26,6 +26,7 @@ import fcntl
 import ipaddress
 from collections import deque
 import psutil
+from netpulse.features import FEATURE_DEFAULTS, FeatureService, rule_state
 
 # Nom de processus propre pour GNOME System Monitor ("Ressources")
 try:
@@ -98,6 +99,7 @@ SNI_XML = """
 """
 
 DEFAULT_CONFIG = {
+    **FEATURE_DEFAULTS,
     "refresh_interval": 1,
     "unit_mode": "auto",
     "show_download": True,
@@ -320,7 +322,7 @@ def parse_socket_traffic():
 
 
 class NetPulseEngine:
-    def __init__(self, enable_tray=False, resume_session=False, preserve_active_tunnel=False):
+    def __init__(self, enable_tray=False, resume_session=False, preserve_active_tunnel=False, enable_features=False):
         self.config = load_config()
         self.enable_tray = enable_tray
 
@@ -343,7 +345,11 @@ class NetPulseEngine:
 
         # Bandwidth history buffer: 60 data points (60 seconds)
         self.history = deque(maxlen=60)
-        self._protected_tunnel = self._tunnel_identity() if preserve_active_tunnel else None
+        self._protected_tunnel = self._tunnel_identity() if preserve_active_tunnel or self.config.get("connection_protected", True) else None
+        self._protection_config = bool(self.config.get("connection_protected", True))
+        self._ctl_results = {}
+        self._feature_service = FeatureService(notify=self._notify_alert) if enable_features else None
+        self.proxy_url = ""
 
         if resume_session:
             self._restore_session()
@@ -371,6 +377,36 @@ class NetPulseEngine:
 
     # Délai minimal avant de relancer une même commande ctl (évite le spam de processus root)
     CTL_RETRY_DELAY = 30.0
+
+    @staticmethod
+    def _notify_alert(event):
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                      "org.freedesktop.Notifications", "Notify",
+                      GLib.Variant("(susssasa{sv}i)", ("NetPulse", 0, "netpulse",
+                                    "Alerte NetPulse", event["message"], [], {}, 8000)),
+                      None, Gio.DBusCallFlags.NONE, 1500, None)
+
+    def _refresh_protection(self):
+        configured = bool(self.config.get("connection_protected", True))
+        if configured:
+            self._protected_tunnel = self._tunnel_identity()
+        elif self._protection_config:
+            self._protected_tunnel = None
+        elif self._protected_tunnel and self._tunnel_identity() != self._protected_tunnel:
+            self._protected_tunnel = None
+        self._protection_config = configured
+
+    def _reap_ctl_jobs(self):
+        now = time.time()
+        for key, (process, started) in list(getattr(self, "_ctl_jobs", {}).items()):
+            result = process.poll()
+            if result is not None:
+                self._ctl_results[key] = result
+                if now - started >= self.CTL_RETRY_DELAY:
+                    del self._ctl_jobs[key]
+        if len(self._ctl_results) > 256:
+            self._ctl_results = dict(list(self._ctl_results.items())[-128:])
 
     @staticmethod
     def _tunnel_identity():
@@ -430,6 +466,7 @@ class NetPulseEngine:
     def _ctl_async(self, *args):
         """Lance une commande netpulse-ctl sans doublons : pas de relance tant que la
         précédente tourne ou pendant le délai de retry. Récolte les processus terminés."""
+        self._reap_ctl_jobs()
         protected = getattr(self, "_protected_tunnel", None)
         if protected:
             if self._tunnel_identity() == protected:
@@ -439,15 +476,13 @@ class NetPulseEngine:
             self._ctl_jobs = {}
         now = time.time()
         # Récolte des processus terminés (évite les zombies)
-        for key, (proc, started) in list(self._ctl_jobs.items()):
-            if proc.poll() is not None and now - started >= self.CTL_RETRY_DELAY:
-                del self._ctl_jobs[key]
         key = tuple(args)
         job = self._ctl_jobs.get(key)
         if job is not None:
             return False
         try:
             proc = subprocess.Popen([CTL_BIN, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._ctl_results.pop(key, None)
             self._ctl_jobs[key] = (proc, now)
             return True
         except Exception:
@@ -637,6 +672,7 @@ class NetPulseEngine:
                 data = json.loads(res.stdout)
                 was_active = self.proxy_active
                 self.proxy_active = bool(data.get("active"))
+                self.proxy_url = data.get("proxy", "") if self.proxy_active else ""
                 proxy_name = data.get("proxy", "TUN")
                 if self.enable_tray and hasattr(self, "mi_proxy"):
                     if self.proxy_active:
@@ -698,6 +734,8 @@ class NetPulseEngine:
 
         # Reload config and blocked apps list
         self.config = load_config()
+        self._refresh_protection()
+        self._reap_ctl_jobs()
         unit_mode = self.config.get("unit_mode", "auto")
         blocked_apps = load_blocked_apps()
 
@@ -771,6 +809,11 @@ class NetPulseEngine:
                 grouped_conns.setdefault(c.pid, []).append(c)
 
         process_list = []
+        application_deltas = []
+        for traffic_pid, sample in current_socket_traffic.items():
+            rate = proc_live_rates.get(traffic_pid, {})
+            application_deltas.append((sample["name"], round(rate.get("rx_speed", 0) * dt),
+                                       round(rate.get("tx_speed", 0) * dt)))
         # Un processus bloqué doit rester visible, même après la fermeture de ses sockets.
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             if is_app_in_split_list(proc.info.get('name') or '', proc.info.get('cmdline') or [], blocked_apps):
@@ -824,7 +867,8 @@ class NetPulseEngine:
                 cmdline = " ".join(argv[:3]) if argv else pname
 
                 matches_blocked = is_app_in_split_list(pname, argv, blocked_apps)
-                is_app_blocked = matches_blocked or (pid in cgroup_blocked_pids)
+                is_app_blocked = pid in cgroup_blocked_pids
+                block_requested = matches_blocked or is_app_blocked
                 if matches_blocked and pid not in cgroup_blocked_pids:
                     self._ctl_async("block", str(pid))
 
@@ -854,7 +898,7 @@ class NetPulseEngine:
                 else:
                     route_mode = "direct"
 
-                if self.proxy_active and not is_app_blocked:
+                if self.proxy_active and not is_app_blocked and not block_requested:
                     destination = "default"
                     if route_mode == "direct" and (split_mode != "include" or is_ftp and self.config.get("bypass_ftp", True)):
                         destination = "direct"
@@ -864,6 +908,18 @@ class NetPulseEngine:
                         (destination == "direct" and pid not in cgroup_direct_pids) or
                         (destination == "default" and pid in cgroup_proxy_pids | cgroup_direct_pids)):
                         self._ctl_async("split-assign", str(pid), destination)
+                actual_group = ("blocked" if is_app_blocked else "proxy" if pid in cgroup_proxy_pids
+                                else "direct" if pid in cgroup_direct_pids else "default")
+                desired_group = "blocked" if block_requested else "default"
+                if not block_requested and self.proxy_active:
+                    if route_mode == "direct" and (split_mode != "include" or is_ftp and self.config.get("bypass_ftp", True)):
+                        desired_group = "direct"
+                    elif route_mode == "proxy" and split_mode == "include":
+                        desired_group = "proxy"
+                command_key = (("block", str(pid)) if block_requested else
+                               ("split-assign", str(pid), desired_group))
+                rule = rule_state(desired_group, actual_group, bool(self._protected_tunnel),
+                                  self._ctl_results.get(command_key, 0) != 0)
 
                 hist = self.proc_traffic_history.get(pid, {})
                 prate = proc_live_rates.get(pid, {'rx_speed': 0.0, 'tx_speed': 0.0,
@@ -918,6 +974,10 @@ class NetPulseEngine:
                     "cmdline": cmdline,
                     "icon": resolve_icon(pname),
                     "is_blocked": is_app_blocked,
+                    "block_requested": block_requested,
+                    "actual_group": actual_group,
+                    "desired_group": desired_group,
+                    "rule_status": rule,
                     "routing": route_mode,
                     "is_in_split": is_in_split,
                     "is_ftp": is_ftp,
@@ -945,6 +1005,7 @@ class NetPulseEngine:
             "session_duration_sec": session_duration,
             "proxy_active": self.proxy_active,
             "network_actions_deferred": bool(getattr(self, "_protected_tunnel", None)),
+            "connection_protected": bool(self.config.get("connection_protected", True)),
             "bypass_ftp": self.config.get("bypass_ftp", True),
             "show_download": self.config.get("show_download", True),
             "show_upload": self.config.get("show_upload", True),
@@ -966,6 +1027,10 @@ class NetPulseEngine:
             "history": list(self.history),
             "processes": process_list
         }
+        if self._feature_service:
+            self._feature_service.submit(payload, rx_diff, tx_diff, application_deltas,
+                                         self.config, self.proxy_url)
+            payload.update(self._feature_service.snapshot())
 
         # Écriture atomique avec fichier temporaire unique par PID (évite les conflits)
         tmp_target = f"{STATS_PATH}.{os.getpid()}.tmp"
@@ -1044,10 +1109,12 @@ def main():
         os.close(lock_fd)
         return
     engine = NetPulseEngine(enable_tray=enable_tray, resume_session="--resume-session" in sys.argv,
-                            preserve_active_tunnel="--preserve-active-tunnel" in sys.argv)
+                            preserve_active_tunnel="--preserve-active-tunnel" in sys.argv, enable_features=True)
     try:
         engine.run()
     finally:
+        if engine._feature_service:
+            engine._feature_service.close()
         os.close(lock_fd)
 
 

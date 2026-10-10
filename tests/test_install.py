@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,7 @@ class InstallerTests(unittest.TestCase):
             icon = destination / 'scalable/apps/netpulse.svg'
             icon.parent.mkdir(parents=True)
             icon.write_bytes((ROOT / 'icons/netpulse.svg').read_bytes())
-            subprocess.run(['python3', '-c', heredoc('PYICONS'), directory], check=True, capture_output=True, timeout=10)
+            subprocess.run([sys.executable, '-c', heredoc('PYICONS'), directory], check=True, capture_output=True, timeout=10)
             for size in (16, 24, 32, 48, 64, 128, 256, 512):
                 surface = cairo.ImageSurface.create_from_png(str(destination / f'{size}x{size}/apps/netpulse.png'))
                 self.assertEqual((surface.get_width(), surface.get_height()), (size, size))
@@ -36,7 +37,7 @@ class InstallerTests(unittest.TestCase):
             executable.chmod(0o755)
             desktop = destination / 'netpulse.desktop'
             desktop.write_bytes((ROOT / 'desktop/netpulse.desktop').read_bytes())
-            subprocess.run(['python3', '-c', heredoc('PYDESKTOP'), str(desktop), str(executable)], check=True, capture_output=True, timeout=10)
+            subprocess.run([sys.executable, '-c', heredoc('PYDESKTOP'), str(desktop), str(executable)], check=True, capture_output=True, timeout=10)
             info = Gio.DesktopAppInfo.new_from_filename(str(desktop))
             self.assertIsNotNone(info)
             self.assertEqual(GLib.shell_parse_argv(info.get_commandline())[1], [str(executable)])

@@ -16,6 +16,9 @@ import subprocess
 import threading
 import ctypes
 import tempfile
+import datetime
+from netpulse.features import (FEATURE_DEFAULTS, HistoryStore, ProfileStore, activate_profile,
+                              proxy_display, validate_diagnostic_url)
 import cairo
 import gi
 
@@ -74,6 +77,7 @@ def resolve_icon(name):
 
 def load_config():
     default_cfg = {
+        **FEATURE_DEFAULTS,
         "refresh_interval": 1,
         "unit_mode": "auto",
         "show_download": True,
@@ -249,6 +253,18 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self.filter_blocked_only = False
         self.current_processes = []
         self.history_data = []
+        self.latest_stats = {}
+        self.current_proxy_url = ""
+        self._last_tun_active = False
+        self._history_pending = False
+        self._history_last = 0
+        self._history_rows = []
+        self._event_rows = []
+        self._event_ids = ()
+        self.profile_store = ProfileStore()
+        self._profile_rows = []
+        self._protection_updating = False
+        self._network_dialog = None
 
         # Tracking state to prevent expander rows from collapsing
         self.expanded_pids = set()
@@ -281,16 +297,56 @@ class NetPulseWindow(Adw.ApplicationWindow):
         return False
 
     def _run_ctl_action(self, args, success_message):
+        self._confirm_network_action("Modifier les règles réseau",
+                                     lambda: self._execute_ctl_action(args, success_message))
+
+    def _confirm_network_action(self, title, callback, always=False):
+        protected = self.config.get("connection_protected", True)
+        if not always and not protected:
+            callback()
+            return
+        if self._network_dialog is not None:
+            self._network_dialog.present()
+            return
+        dialog = Adw.MessageDialog.new(self, title,
+            "Cette action peut changer le trajet du trafic ou interrompre des connexions. "
+            "Le tunnel actuel reste inchangé tant que vous n'appliquez pas cette action.")
+        dialog.add_response("cancel", "Conserver la connexion")
+        dialog.add_response("apply", "Appliquer")
+        dialog.set_response_appearance("apply", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        self._network_dialog = dialog
+        def response(_, choice):
+            self._network_dialog = None
+            if not self._closed:
+                if choice == "apply":
+                    callback()
+                else:
+                    self._poll_stats()
+        dialog.connect("response", response)
+        dialog.present()
+
+    def _execute_ctl_action(self, args, success_message):
+        if self.is_busy:
+            return
+        self.is_busy = True
         def worker():
             try:
                 env = os.environ.copy()
                 env["NETPULSE_ALLOW_GUI_PROMPT"] = "1"
                 result = subprocess.run([self.ctl_bin, *args], env=env, capture_output=True, text=True, timeout=60)
                 message = success_message if result.returncode == 0 else (result.stderr.strip() or "La commande réseau a échoué.")
+                if result.returncode:
+                    try:
+                        HistoryStore().add_event("rule_error", args[0], f"La commande « {args[0]} » a échoué.", cooldown=30)
+                    except Exception:
+                        pass
             except Exception as exc:
                 message = f"Commande impossible : {exc}"
             def done():
                 if not self._closed:
+                    self.is_busy = False
                     self.toast_overlay.add_toast(Adw.Toast.new(message))
                     self._poll_stats()
                 return GLib.SOURCE_REMOVE
@@ -318,7 +374,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
             pass
         if not running:
             try:
-                subprocess.Popen([self.mon_bin], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen([self.mon_bin, "--resume-session", "--preserve-active-tunnel"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
@@ -328,6 +385,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
 
         toolbar_view = Adw.ToolbarView()
         self.toast_overlay.set_child(toolbar_view)
+        self.protection_banner = Adw.Banner.new("Connexion protégée : les nouvelles affectations automatiques sont différées.")
 
         header = Adw.HeaderBar()
         self.view_stack = Adw.ViewStack()
@@ -338,6 +396,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
         header.set_title_widget(switcher_title)
 
         toolbar_view.add_top_bar(header)
+        toolbar_view.add_top_bar(self.protection_banner)
         toolbar_view.set_content(self.view_stack)
 
         view_switcher_bar = Adw.ViewSwitcherBar()
@@ -349,6 +408,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
         # Build the 3 Tabs
         self._build_glasswire_tab()
         self._build_proxy_tab()
+        self._build_diagnostic_tab()
+        self._build_history_tab()
         self._build_settings_tab()
 
     # -----------------------------------------------------------------
@@ -462,8 +523,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
         self.search_entry.connect("search-changed", self._on_search_changed)
         search_box.append(self.search_entry)
 
-        self.btn_filter_blocked = Gtk.ToggleButton(label="Bloqués (Pare-feu)")
-        self.btn_filter_blocked.set_tooltip_text("Afficher uniquement les applications bloquées par le pare-feu")
+        self.btn_filter_blocked = Gtk.ToggleButton(label="Blocages (Pare-feu)")
+        self.btn_filter_blocked.set_tooltip_text("Afficher les applications bloquées ou dont le blocage est en attente")
         self.btn_filter_blocked.connect("toggled", self._on_filter_blocked_toggled)
         search_box.append(self.btn_filter_blocked)
 
@@ -514,7 +575,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
     # -----------------------------------------------------------------
     def _render_process_list(self):
         def match_process(p):
-            if self.filter_blocked_only and not p.get("is_blocked"):
+            if self.filter_blocked_only and not (p.get("is_blocked") or p.get("block_requested")):
                 return False
             if not self.search_filter:
                 return True
@@ -557,7 +618,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
             hosts_list = p.get("contacted_hosts", [])
             hosts_str = ", ".join(hosts_list[:3])
             hosts_info = f" • 🌐 Hôtes : {hosts_str}" if hosts_str else ""
-            subtitle_text = f"PID: {pid} • {p['status']} • Total: ↓ {p['total_rx_formatted']} | ↑ {p['total_tx_formatted']}{hosts_info}"
+            rule = p.get("rule_status", {"label": "À vérifier", "state": "unknown", "detail": "Aucun état d'affectation disponible."})
+            subtitle_text = f"PID: {pid} • {p['status']} • {rule['label']} • Total: ↓ {p['total_rx_formatted']} | ↑ {p['total_tx_formatted']}{hosts_info}"
 
             # ---------------------------------------------------------
             # UPDATE EXISTING ROW IN-PLACE (DOES NOT COLLAPSE EXPANDER)
@@ -575,16 +637,9 @@ class NetPulseWindow(Adw.ApplicationWindow):
 
                 route_badge = w.get("route_badge")
                 if route_badge:
-                    is_proxy_route = p.get("routing") == "proxy"
-                    is_ftp = p.get("is_ftp", False) and self.bypass_ftp and not is_proxy_route
-                    if is_ftp:
-                        route_badge.set_label("📁 FTP Direct")
-                        route_badge.set_css_classes(["caption", "accent", "heading"])
-                        route_badge.set_tooltip_text("Flux FTP direct (Exempté du proxy pour garantir les transferts sans timeout)")
-                    else:
-                        route_badge.set_label("⚡ Proxy" if is_proxy_route else "🌐 Direct")
-                        route_badge.set_css_classes(["caption", "success" if is_proxy_route else "accent", "heading"])
-                        route_badge.set_tooltip_text("Routage actif : Proxy TUN" if is_proxy_route else "Routage actif : Connexion Directe")
+                    route_badge.set_label(rule["label"])
+                    route_badge.set_css_classes(["caption", "success" if rule["state"] == "applied" else "error" if rule["state"] == "error" else "dim-label"])
+                    route_badge.set_tooltip_text(rule["detail"] + " Politique configurée : " + p.get("routing", "inconnue"))
 
                 btn_split = w.get("btn_split")
                 if btn_split:
@@ -598,9 +653,9 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     btn_block.set_css_classes(["destructive-action"])
                     btn_block.set_tooltip_text(f"Cliquer pour autoriser à nouveau l'accès internet à {pname}")
                 else:
-                    btn_block.set_label("Bloquer")
+                    btn_block.set_label("Annuler" if p.get("block_requested") else "Bloquer")
                     btn_block.set_css_classes([])
-                    btn_block.set_tooltip_text(f"Couper immédiatement tout accès internet à {pname} (Pare-feu)")
+                    btn_block.set_tooltip_text("Retirer la demande de blocage" if p.get("block_requested") else f"Couper immédiatement tout accès internet à {pname} (Pare-feu)")
 
                 # Les hôtes et les adresses changent même lorsque le nombre de sockets reste stable.
                 conns = p.get("connections", [])
@@ -631,16 +686,9 @@ class NetPulseWindow(Adw.ApplicationWindow):
                 suffix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 suffix_box.set_valign(Gtk.Align.CENTER)
 
-                is_proxy_route = p.get("routing") == "proxy"
-                is_ftp = p.get("is_ftp", False) and self.bypass_ftp and not is_proxy_route
-                if is_ftp:
-                    route_badge = Gtk.Label(label="📁 FTP Direct")
-                    route_badge.set_css_classes(["caption", "accent", "heading"])
-                    route_badge.set_tooltip_text("Flux FTP direct (Exempté du proxy pour garantir les transferts sans timeout)")
-                else:
-                    route_badge = Gtk.Label(label="⚡ Proxy" if is_proxy_route else "🌐 Direct")
-                    route_badge.set_css_classes(["caption", "success" if is_proxy_route else "accent", "heading"])
-                    route_badge.set_tooltip_text("Routage actif : Proxy TUN" if is_proxy_route else "Routage actif : Connexion Directe")
+                route_badge = Gtk.Label(label=rule["label"])
+                route_badge.set_css_classes(["caption", "success" if rule["state"] == "applied" else "error" if rule["state"] == "error" else "dim-label"])
+                route_badge.set_tooltip_text(rule["detail"] + " Politique configurée : " + p.get("routing", "inconnue"))
                 suffix_box.append(route_badge)
 
                 in_split = p.get("is_in_split", False)
@@ -670,8 +718,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
                     btn_block.add_css_class("destructive-action")
                     btn_block.set_tooltip_text(f"Cliquer pour autoriser à nouveau l'accès internet à {pname}")
                 else:
-                    btn_block.set_label("Bloquer")
-                    btn_block.set_tooltip_text(f"Couper immédiatement tout accès internet à {pname} (Pare-feu)")
+                    btn_block.set_label("Annuler" if p.get("block_requested") else "Bloquer")
+                    btn_block.set_tooltip_text("Retirer la demande de blocage" if p.get("block_requested") else f"Couper immédiatement tout accès internet à {pname} (Pare-feu)")
 
                 btn_block.connect("clicked", self._on_toggle_app_block, pname, pid)
                 suffix_box.append(btn_block)
@@ -741,7 +789,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
 
     def _on_toggle_app_block(self, btn, app_name, pid):
         w = self.row_widgets.get(pid)
-        currently_blocked = False
+        currently_blocked = any(p["pid"] == pid and p.get("block_requested") for p in self.current_processes)
         if w and w["btn_block"].get_label() == "Bloqué":
             currently_blocked = True
 
@@ -755,6 +803,13 @@ class NetPulseWindow(Adw.ApplicationWindow):
     # -----------------------------------------------------------------
     def _build_proxy_tab(self):
         page = Adw.PreferencesPage()
+        protection = Adw.PreferencesGroup(title="Protection de la connexion")
+        page.add(protection)
+        self.protection_switch = Adw.SwitchRow(title="Connexion protégée",
+            subtitle="Diffère les automatismes réseau et signale les changements pouvant interrompre la connexion.")
+        self.protection_switch.set_active(self.config.get("connection_protected", True))
+        self.protection_switch.connect("notify::active", self._on_protection_changed)
+        protection.add(self.protection_switch)
 
         # Groupe 1 : Forçage Global
         group_force = Adw.PreferencesGroup()
@@ -813,7 +868,7 @@ class NetPulseWindow(Adw.ApplicationWindow):
         group_split.add(self.bypass_ftp_switch)
 
         self.split_info_row = Adw.ActionRow()
-        self.split_info_row.set_title("Comportement actif")
+        self.split_info_row.set_title("Politique configurée")
         group_split.add(self.split_info_row)
 
         self.split_entry = Adw.EntryRow()
@@ -886,9 +941,19 @@ class NetPulseWindow(Adw.ApplicationWindow):
         save_row.set_title("Enregistrer la configuration")
         save_row.set_subtitle("Met à jour les paramètres système GNOME")
         save_btn = Gtk.Button(label="Enregistrer", css_classes=["suggested-action"])
-        save_btn.connect("clicked", lambda b: self._save_gsettings(show_toast=True))
+        save_btn.connect("clicked", lambda b: self._confirm_network_action(
+            "Modifier le proxy des applications", lambda: self._save_gsettings(show_toast=True)))
         save_row.add_suffix(save_btn)
         group_actions.add(save_row)
+        self.profiles_group = Adw.PreferencesGroup(title="Profils de connexion",
+            description="Enregistrer et préparer un profil ne modifie pas le réseau. Son activation est une action explicite.")
+        page.add(self.profiles_group)
+        create = Adw.ActionRow(title="Préparer un profil")
+        button = Gtk.Button(label="Créer", valign=Gtk.Align.CENTER)
+        button.connect("clicked", lambda _: self._edit_profile())
+        create.add_suffix(button)
+        self.profiles_group.add(create)
+        self._render_profiles()
 
         self.view_stack.add_titled_with_icon(
             page,
@@ -1028,6 +1093,294 @@ class NetPulseWindow(Adw.ApplicationWindow):
     # -----------------------------------------------------------------
     # ONGLET 3 : PARAMÈTRES DE L'INDICATEUR (SPEED METER)
     # -----------------------------------------------------------------
+    def _on_protection_changed(self, row, _param):
+        if self._protection_updating:
+            return
+        requested = row.get_active()
+        previous = self.config.get("connection_protected", True)
+        def apply():
+            if save_config({"connection_protected": requested}):
+                self.config["connection_protected"] = requested
+                self._protection_updating = True
+                row.set_active(requested)
+                self._protection_updating = False
+            else:
+                self.toast_overlay.add_toast(Adw.Toast.new("La protection n'a pas pu être enregistrée."))
+        if requested:
+            apply()
+        else:
+            self._protection_updating = True
+            row.set_active(previous)
+            self._protection_updating = False
+            self._confirm_network_action("Autoriser les automatismes réseau", apply)
+
+    def _build_diagnostic_tab(self):
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(title="Diagnostic de connexion",
+            description="Vérifications en lecture seule. Le test TCP du serveur ne valide pas ses identifiants ; le test HTTPS vérifie le trajet actuellement utilisé.")
+        page.add(group)
+        self.diagnostic_rows = {}
+        for key, title in (("server", "Serveur proxy"), ("tunnel", "Tunnel"),
+                           ("dns", "Résolution DNS"), ("internet", "Accès HTTPS")):
+            row = Adw.ActionRow(title=title, subtitle="En attente du premier diagnostic")
+            row.set_use_markup(False)
+            badge = Gtk.Label(label="À vérifier", valign=Gtk.Align.CENTER)
+            row.add_suffix(badge)
+            group.add(row)
+            self.diagnostic_rows[key] = (row, badge)
+        self.diagnostic_time_row = Adw.ActionRow(title="Dernière vérification")
+        probe = Gtk.Button(label="Vérifier maintenant", valign=Gtk.Align.CENTER)
+        probe.connect("clicked", lambda _: save_config({"diagnostic_request": time.time_ns()}))
+        self.diagnostic_time_row.add_suffix(probe)
+        group.add(self.diagnostic_time_row)
+        self.storage_status_row = Adw.ActionRow(title="Historique et alertes", subtitle="Démarrage du stockage local")
+        group.add(self.storage_status_row)
+        self.events_group = Adw.PreferencesGroup(title="Événements récents")
+        page.add(self.events_group)
+        self.view_stack.add_titled_with_icon(page, "diagnostic", "Diagnostic", "network-transmit-receive-symbolic")
+
+    def _update_feature_status(self, data):
+        protected = data.get("connection_protected", self.config.get("connection_protected", True))
+        deferred = data.get("network_actions_deferred", False)
+        self.protection_banner.set_revealed(bool(data.get("proxy_active") and (protected or deferred)))
+        self.protection_banner.set_title(
+            "Connexion protégée : les nouvelles affectations automatiques sont différées."
+            if deferred else "Connexion protégée : les changements réseau nécessitent une action explicite.")
+        self._protection_updating = True
+        self.protection_switch.set_active(protected)
+        self._protection_updating = False
+        diagnostics = data.get("diagnostics", {})
+        stamp = diagnostics.get("timestamp", 0)
+        stale = not stamp or time.time() - stamp > max(120, self.config.get("diagnostic_interval", 60) * 2)
+        labels = {"ok": "Disponible", "error": "Échec", "unknown": "À vérifier",
+                  "inactive": "Inactif", "warning": "Réponse HTTP"}
+        for key, (row, badge) in self.diagnostic_rows.items():
+            value = diagnostics.get(key, {})
+            if key == "tunnel":
+                value = {"state": "ok" if data.get("proxy_active") else "inactive",
+                         "detail": "Tunnel actif" if data.get("proxy_active") else "Tunnel inactif"}
+            state = value.get("state", "unknown")
+            detail = value.get("detail", "Diagnostic désactivé" if not self.config.get("diagnostics_enabled", True) else "En attente")
+            if value.get("latency_ms") is not None:
+                detail += f" • {value['latency_ms']:.1f} ms"
+            row.set_subtitle(detail)
+            outdated = stale and key != "tunnel"
+            badge.set_label("À actualiser" if outdated and stamp else labels.get(state, "À vérifier"))
+            badge.set_css_classes(["success" if state == "ok" and not outdated else "error" if state == "error" and not outdated else "dim-label"])
+        self.diagnostic_time_row.set_subtitle(
+            datetime.datetime.fromtimestamp(stamp).astimezone().strftime("%d/%m/%Y %H:%M:%S")
+            if stamp else "Aucune vérification disponible")
+        self.storage_status_row.set_subtitle(data.get("storage_error") or "Enregistrement local • données globales TCP+UDP, applications TCP échantillonné")
+        self._render_events(data.get("alerts", []))
+
+    def _render_events(self, events):
+        ids = tuple(event["id"] for event in events[:15])
+        if ids == self._event_ids:
+            return
+        self._event_ids = ids
+        for row in self._event_rows:
+            self.events_group.remove(row)
+        self._event_rows = []
+        for event in events[:15]:
+            row = Adw.ActionRow(title=event["message"],
+                subtitle=datetime.datetime.fromtimestamp(event["timestamp"]).astimezone().strftime("%d/%m/%Y %H:%M"))
+            row.set_use_markup(False)
+            self.events_group.add(row)
+            self._event_rows.append(row)
+
+    def _build_history_tab(self):
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(title="Consommation enregistrée",
+            description="L'historique commence à l'activation de cette version. Les totaux physiques et les compteurs TCP des applications sont deux mesures distinctes.")
+        page.add(group)
+        self.history_period = Adw.ComboRow(title="Période", model=Gtk.StringList.new(["Aujourd'hui", "7 jours", "30 jours"]))
+        group.add(self.history_period)
+        self.history_totals_row = Adw.ActionRow(title="Total des interfaces physiques", subtitle="Lecture de l'historique…")
+        export = Gtk.Button(label="Exporter CSV", valign=Gtk.Align.CENTER)
+        export.connect("clicked", self._export_history)
+        self.history_totals_row.add_suffix(export)
+        group.add(self.history_totals_row)
+        self.daily_history_group = Adw.PreferencesGroup(title="Par jour")
+        self.app_history_group = Adw.PreferencesGroup(title="Par application • TCP échantillonné")
+        page.add(self.daily_history_group)
+        page.add(self.app_history_group)
+        self.history_period.connect("notify::selected", lambda *_: self._refresh_history(force=True))
+        self.view_stack.add_titled_with_icon(page, "history", "Historique", "document-open-recent-symbolic")
+
+    def _history_days(self):
+        return (1, 7, 30)[min(self.history_period.get_selected(), 2)]
+
+    def _refresh_history(self, force=False):
+        if self._history_pending or self._closed or (not force and time.monotonic() - self._history_last < 10):
+            return
+        self._history_pending = True
+        self._history_last = time.monotonic()
+        days = self._history_days()
+        def worker():
+            summary, error = None, None
+            try:
+                summary = HistoryStore().summary(days)
+            except Exception:
+                error = "L'historique local est momentanément indisponible."
+            def done():
+                self._history_pending = False
+                if self._closed:
+                    return GLib.SOURCE_REMOVE
+                if days != self._history_days():
+                    self._refresh_history(force=True)
+                    return GLib.SOURCE_REMOVE
+                if error:
+                    self.history_totals_row.set_subtitle(error)
+                    return GLib.SOURCE_REMOVE
+                self.history_totals_row.set_subtitle(f"↓ {format_bytes(summary['rx'])} • ↑ {format_bytes(summary['tx'])}")
+                for parent, row in self._history_rows:
+                    parent.remove(row)
+                self._history_rows = []
+                for group, rows, name in ((self.daily_history_group, summary["days"], "day"),
+                                           (self.app_history_group, summary["applications"], "app")):
+                    for item in rows:
+                        row = Adw.ActionRow(title=item[name], subtitle=f"↓ {format_bytes(item['rx'])} • ↑ {format_bytes(item['tx'])}")
+                        row.set_use_markup(False)
+                        group.add(row)
+                        self._history_rows.append((group, row))
+                    if not rows:
+                        row = Adw.ActionRow(title="Aucune donnée pour cette période")
+                        group.add(row)
+                        self._history_rows.append((group, row))
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(done)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _export_history(self, _button):
+        chooser = Gtk.FileChooserNative.new("Exporter l'historique", self, Gtk.FileChooserAction.SAVE, "Exporter", "Annuler")
+        chooser.set_current_name("netpulse-historique.csv")
+        days = self._history_days()
+        def response(dialog, choice):
+            selected = dialog.get_file() if choice == Gtk.ResponseType.ACCEPT else None
+            path = selected.get_path() if selected else None
+            dialog.destroy()
+            if not path:
+                return
+            def worker():
+                try:
+                    count = HistoryStore().export_csv(path, days)
+                    message = f"Historique exporté : {count} relevé(s)."
+                except Exception:
+                    message = "Impossible d'exporter l'historique vers ce fichier."
+                def done():
+                    if not self._closed:
+                        self.toast_overlay.add_toast(Adw.Toast.new(message))
+                    return GLib.SOURCE_REMOVE
+                GLib.idle_add(done)
+            threading.Thread(target=worker, daemon=True).start()
+        chooser.connect("response", response)
+        chooser.show()
+
+    def _render_profiles(self):
+        for row in self._profile_rows:
+            self.profiles_group.remove(row)
+        self._profile_rows = []
+        try:
+            profiles = self.profile_store.list()
+        except (ValueError, OSError, KeyError):
+            profiles = []
+            row = Adw.ActionRow(title="Le fichier des profils est invalide ou inaccessible.")
+            self.profiles_group.add(row)
+            self._profile_rows.append(row)
+        for profile in profiles:
+            row = Adw.ActionRow(title=profile["name"],
+                subtitle=f"{proxy_display(profile['proxy_url'])} • {profile['split_mode']} • {len(profile['split_apps'])} application(s)")
+            row.set_use_markup(False)
+            for title, callback in (
+                    ("Modifier", lambda _, p=profile: self._edit_profile(p)),
+                    ("Activer", lambda _, p=profile: self._confirm_network_action(
+                        f"Activer « {p['name']} » — {proxy_display(p['proxy_url'])}",
+                        lambda: self._activate_profile(p), always=True)),
+                    ("Supprimer", lambda _, p=profile: self._delete_profile(p["id"]))):
+                button = Gtk.Button(label=title, valign=Gtk.Align.CENTER)
+                button.connect("clicked", callback)
+                row.add_suffix(button)
+            self.profiles_group.add(row)
+            self._profile_rows.append(row)
+
+    def _delete_profile(self, profile_id):
+        try:
+            self.profile_store.delete(profile_id)
+            self._render_profiles()
+        except (ValueError, OSError):
+            self.toast_overlay.add_toast(Adw.Toast.new("Le profil n'a pas pu être supprimé."))
+
+    def _edit_profile(self, profile=None):
+        draft = profile or {"name": "", "proxy_url": self.current_proxy_url,
+                            "split_mode": self.split_mode, "split_apps": list(self.split_apps), "bypass_ftp": self.bypass_ftp}
+        dialog = Adw.MessageDialog.new(self, "Modifier le profil" if profile else "Préparer un profil",
+            "Enregistrer ne modifie pas la connexion. Les profils sont stockés localement avec un accès réservé à votre utilisateur.")
+        group = Adw.PreferencesGroup()
+        name = Adw.EntryRow(title="Nom", text=draft["name"])
+        proxy = Adw.PasswordEntryRow(title="URL du proxy (socks5://hôte:port)", text=draft["proxy_url"])
+        mode = Adw.ComboRow(title="Split tunneling",
+            model=Gtk.StringList.new(["Global", "Inclusif", "Exclusif"]),
+            selected=("disabled", "include", "exclude").index(draft["split_mode"]))
+        apps = Adw.EntryRow(title="Applications séparées par des virgules", text=", ".join(draft["split_apps"]))
+        ftp = Adw.SwitchRow(title="Exempter le FTP", active=draft["bypass_ftp"])
+        for row in (name, proxy, mode, apps, ftp):
+            group.add(row)
+        dialog.set_extra_child(group)
+        dialog.add_response("cancel", "Annuler")
+        dialog.add_response("save", "Enregistrer")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("save")
+        dialog.set_close_response("cancel")
+        def response(_, choice):
+            if choice != "save" or self._closed:
+                return
+            values = {"name": name.get_text(), "proxy_url": proxy.get_text(),
+                      "split_mode": ("disabled", "include", "exclude")[mode.get_selected()],
+                      "split_apps": [item.strip() for item in apps.get_text().split(",") if item.strip()],
+                      "bypass_ftp": ftp.get_active()}
+            try:
+                self.profile_store.save(values, profile["id"] if profile else None)
+                self._render_profiles()
+                self.toast_overlay.add_toast(Adw.Toast.new("Profil enregistré sans modifier la connexion."))
+            except (ValueError, OSError) as exc:
+                self.toast_overlay.add_toast(Adw.Toast.new(str(exc) if isinstance(exc, ValueError) else "Écriture du profil impossible."))
+        dialog.connect("response", response)
+        dialog.present()
+
+    def _activate_profile(self, profile):
+        if self.is_busy:
+            return
+        self.is_busy = True
+        current_proxy = self.current_proxy_url
+        def worker():
+            def execute(args):
+                env = dict(os.environ, NETPULSE_ALLOW_GUI_PROMPT="1")
+                result = subprocess.run([self.ctl_bin, *args], capture_output=True, text=True, timeout=60, env=env)
+                if result.returncode:
+                    raise RuntimeError(f"La commande « {args[0]} » a échoué.")
+            try:
+                activate_profile(profile, CONFIG_PATH, SPLIT_APPS_FILE, execute, current_proxy)
+                message = f"Profil « {profile['name']} » appliqué."
+                try:
+                    HistoryStore().add_event("profile", profile["id"], message)
+                except Exception:
+                    pass
+            except Exception:
+                message = "Le profil n'a pas pu être appliqué. Les paramètres précédents ont été restaurés ; consultez le diagnostic réseau."
+                try:
+                    HistoryStore().add_event("profile_error", profile["id"], message)
+                except Exception:
+                    pass
+            def done():
+                self.is_busy = False
+                if not self._closed:
+                    self.toast_overlay.add_toast(Adw.Toast.new(message))
+                    self._load_gsettings()
+                    self._poll_stats()
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(done)
+        threading.Thread(target=worker, daemon=True).start()
+
     def _build_settings_tab(self):
         page = Adw.PreferencesPage()
 
@@ -1087,6 +1440,37 @@ class NetPulseWindow(Adw.ApplicationWindow):
             "Paramètres Indicateur",
             "preferences-other-symbolic"
         )
+        features = Adw.PreferencesGroup(title="Diagnostic, historique et alertes")
+        page.add(features)
+        for key, title, subtitle in (
+                ("diagnostics_enabled", "Vérifier la connexion périodiquement", "Requêtes DNS, connexion TCP au serveur et requête HTTPS."),
+                ("alert_server_down", "Alerter si le serveur est indisponible", "Après deux diagnostics successifs en échec."),
+                ("alert_notifications", "Afficher les notifications de bureau", "Les événements restent consultables dans Diagnostic.")):
+            row = Adw.SwitchRow(title=title, subtitle=subtitle, active=self.config.get(key, FEATURE_DEFAULTS[key]))
+            row.connect("notify::active", lambda widget, _param, k=key: save_config({k: widget.get_active()}))
+            features.add(row)
+        for key, title, subtitle, minimum, maximum in (
+                ("diagnostic_interval", "Intervalle des diagnostics (secondes)", "De 30 à 600 secondes.", 30, 600),
+                ("history_retention_days", "Conserver l'historique (jours)", "Les données plus anciennes sont supprimées automatiquement.", 1, 365),
+                ("alert_daily_mib", "Seuil quotidien (Mio)", "0 désactive cette alerte ; le total physique est utilisé.", 0, 1000000),
+                ("alert_app_rate_mib", "Débit inhabituel par application (Mio/s)", "0 désactive cette alerte ; trois relevés TCP successifs sont nécessaires.", 0, 10000),
+                ("alert_cooldown_sec", "Délai entre alertes identiques (secondes)", "Évite les notifications répétées.", 30, 86400)):
+            row = Adw.SpinRow.new_with_range(minimum, maximum, 1)
+            row.set_title(title)
+            row.set_subtitle(subtitle)
+            row.set_value(self.config.get(key, FEATURE_DEFAULTS[key]))
+            row.connect("notify::value", lambda widget, _param, k=key: save_config({k: widget.get_value()}))
+            features.add(row)
+        endpoint = Adw.EntryRow(title="URL HTTPS du diagnostic", text=self.config.get("diagnostic_url", "https://github.com"))
+        endpoint.set_show_apply_button(True)
+        def save_endpoint(widget):
+            try:
+                url = validate_diagnostic_url(widget.get_text().strip())
+                save_config({"diagnostic_url": url, "diagnostic_request": time.time_ns()})
+            except (ValueError, TypeError):
+                self.toast_overlay.add_toast(Adw.Toast.new("Utilisez une URL HTTPS valide sans identifiants."))
+        endpoint.connect("apply", save_endpoint)
+        features.add(endpoint)
 
     def _on_indicator_setting_changed(self, *args):
         self.config["show_download"] = self.sw_show_down.get_active()
@@ -1118,6 +1502,10 @@ class NetPulseWindow(Adw.ApplicationWindow):
             try:
                 with open(STATS_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                self.latest_stats = data
+                self._update_feature_status(data)
+                if self.view_stack.get_visible_child_name() == "history":
+                    self._refresh_history()
 
                 rx_fmt = data.get("rx_speed_formatted", "0 o/s")
                 tx_fmt = data.get("tx_speed_formatted", "0 o/s")
@@ -1231,6 +1619,16 @@ class NetPulseWindow(Adw.ApplicationWindow):
             return
 
         want_active = self.force_switch_row.get_active()
+        self.updating_switch = True
+        self.force_switch_row.set_active(self._last_tun_active)
+        self.updating_switch = False
+        self._confirm_network_action("Activer le tunnel" if want_active else "Arrêter le tunnel",
+                                     lambda: self._perform_force_change(want_active))
+
+    def _perform_force_change(self, want_active):
+        self.updating_switch = True
+        self.force_switch_row.set_active(want_active)
+        self.updating_switch = False
         if want_active and not self.enable_proxy_row.get_active():
             self.enable_proxy_row.set_active(True)
         self._save_gsettings(show_toast=False)
@@ -1298,6 +1696,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_tun_status(self, data):
+        self._last_tun_active = bool(data.get("active"))
+        self.current_proxy_url = data.get("proxy", "") if self._last_tun_active else ""
         is_active = bool(data.get("active"))
         proxy_target = data.get("proxy", "Inconnu")
 

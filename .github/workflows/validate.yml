@@ -1,0 +1,53 @@
+name: Validation NetPulse
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-gi python3-cairo python3-gi-cairo python3-psutil python3-venv python3-pip gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-rsvg-2.0 xvfb
+          /usr/bin/python3 -m venv --system-site-packages .venv
+          .venv/bin/python -m pip install build
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Check generated executables
+        run: .venv/bin/python tools/build_executables.py --check
+      - name: Check syntax
+        run: |
+          bash -n install.sh uninstall.sh src/netpulse/ctl.sh bin/netpulse-ctl
+          .venv/bin/python -m compileall -q src tests tools live-upgrade.py
+          .venv/bin/python -m py_compile bin/netpulse-gui bin/netpulse-monitor
+          node --input-type=module --check < extension/extension.js
+          git diff --check
+      - name: Run regression tests
+        env:
+          GSETTINGS_BACKEND: memory
+        run: |
+          .venv/bin/python -m unittest discover -s tests -v
+          node tests/test_extension.cjs
+      - name: Verify the GTK interface in an isolated display
+        env:
+          GSETTINGS_BACKEND: memory
+          GSK_RENDERER: cairo
+        run: xvfb-run -a .venv/bin/python tools/gui_smoke.py
+      - name: Build and verify the wheel
+        run: |
+          .venv/bin/python -m build --wheel
+          .venv/bin/python tools/check_wheel.py dist/*.whl

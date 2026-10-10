@@ -1,18 +1,49 @@
 import importlib.util
 import json
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'src'))
 spec = importlib.util.spec_from_file_location('netpulse_gui_test', ROOT / 'src/netpulse/gui.py')
 gui = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gui)
 
 
 class GuiTests(unittest.TestCase):
+    def test_protected_action_waits_for_explicit_response_and_cancel_does_not_execute(self):
+        fake = SimpleNamespace(config={"connection_protected": True}, latest_stats={"proxy_active": True},
+                               _last_tun_active=True, _network_dialog=None, _closed=False, _poll_stats=Mock())
+        callback, dialog = Mock(), Mock()
+        with patch.object(gui.Adw.MessageDialog, "new", return_value=dialog):
+            gui.NetPulseWindow._confirm_network_action(fake, "Changer le réseau", callback)
+        callback.assert_not_called()
+        response = dialog.connect.call_args.args[1]
+        response(dialog, "cancel")
+        callback.assert_not_called()
+        self.assertIsNone(fake._network_dialog)
+
+    def test_protected_action_executes_only_after_apply_response(self):
+        fake = SimpleNamespace(config={"connection_protected": True}, latest_stats={"proxy_active": True},
+                               _last_tun_active=True, _network_dialog=None, _closed=False, _poll_stats=Mock())
+        callback, dialog = Mock(), Mock()
+        with patch.object(gui.Adw.MessageDialog, "new", return_value=dialog):
+            gui.NetPulseWindow._confirm_network_action(fake, "Changer le réseau", callback)
+        dialog.connect.call_args.args[1](dialog, "apply")
+        callback.assert_called_once()
+
+    def test_profile_activation_is_confirmed_even_with_inactive_tunnel(self):
+        fake = SimpleNamespace(config={"connection_protected": False}, latest_stats={"proxy_active": False},
+                               _last_tun_active=False, _network_dialog=None, _closed=False, _poll_stats=Mock())
+        callback = Mock()
+        with patch.object(gui.Adw.MessageDialog, "new", return_value=Mock()):
+            gui.NetPulseWindow._confirm_network_action(fake, "Profil", callback, always=True)
+        callback.assert_not_called()
+
     def test_new_instance_does_not_replace_existing_application(self):
         app = gui.NetPulseApp(new_instance=True)
         self.assertTrue(app.get_flags() & gui.Gio.ApplicationFlags.NON_UNIQUE)

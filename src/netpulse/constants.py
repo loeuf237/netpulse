@@ -3,6 +3,7 @@ Constantes et chemins de configuration pour NetPulse.
 """
 
 import os
+from .features import FEATURE_DEFAULTS
 
 APP_ID = "org.antigravity.NetPulse"
 CONFIG_DIR = os.path.expanduser("~/.config/force-proxy")
@@ -14,6 +15,7 @@ RESET_FLAG_PATH = "/tmp/netpulse_reset_flag"
 PID_FILE = "/tmp/netpulse_monitor.pid"
 
 DEFAULT_CONFIG = {
+    **FEATURE_DEFAULTS,
     "refresh_interval": 1,
     "unit_mode": "auto",
     "show_download": True,
@@ -39,4 +41,3 @@ FTP_KNOWN_APPS = {
     "pure-ftpd"
 }
 FTP_PORTS = {20, 21, 989, 990}
-

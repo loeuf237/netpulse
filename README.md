@@ -60,6 +60,58 @@ Conçu avec les technologies les plus récentes de l'écosystème Linux (**GTK4*
 
 ---
 
+## Nouveautés de la version 1.1
+
+- **Connexion protégée**, activée par défaut : bandeau pendant un tunnel actif,
+  affectations automatiques différées et confirmation avant les changements réseau depuis
+  l'interface. Désactiver cette protection autorise explicitement les automatismes.
+- **Diagnostic** : disponibilité TCP du serveur, état du tunnel, résolution DNS et requête
+  HTTPS avec temps de réponse. Les sondes utilisent les routes existantes, sans les modifier.
+  L'URL HTTPS par défaut est `https://github.com`, avec un intervalle de 60 secondes réglable.
+  Le test TCP ne valide pas les identifiants du proxy ; une réponse HTTP d'erreur reste
+  distinguée d'une impossibilité d'établir HTTPS.
+- **État des affectations** : badges « Appliquée », « En attente » et « En erreur », fondés
+  sur les cgroups constatés et les résultats des commandes. Une affectation appliquée ne
+  signifie pas que les sockets déjà ouvertes ont changé de trajet.
+- **Historique local** : consommation d'aujourd'hui, des 7 ou 30 derniers jours, détail
+  quotidien et classement des applications, export CSV. Les données commencent avec
+  l'activation de cette version ; aucune consommation antérieure n'est reconstruite.
+- **Alertes** : serveur indisponible sur deux sondes successives, seuil quotidien en Mio
+  et débit TCP inhabituel par application sur trois relevés. Les deux seuils sont
+  désactivés par défaut (`0`). Notifications et délai de répétition sont configurables ;
+  les alertes n'effectuent aucun changement réseau.
+- **Profils** : créer, modifier, supprimer et activer un serveur avec sa liste de split
+  tunneling et son exemption FTP. La préparation est locale ; l'activation nécessite
+  une confirmation. Le tunnel est réutilisé si l'URL du serveur est identique.
+
+Les paramètres se trouvent dans **Paramètres Indicateur**. L'historique SQLite est stocké
+dans `~/.local/state/netpulse/history.sqlite3` (ou sous `XDG_STATE_HOME`), avec 90 jours
+de conservation par défaut, réglables de 1 à 365 jours. Les profils restent dans
+`~/.config/force-proxy/profiles.json`, avec des permissions `0600`. Ils peuvent contenir
+les identifiants du serveur ; ceux-ci sont masqués dans les descriptions et ne sont
+jamais exportés dans l'historique.
+
+Les totaux globaux incluent TCP et UDP sur les interfaces physiques. Les totaux par
+application restent des mesures TCP échantillonnées ; ils ne doivent pas être additionnés
+au total global. La remise à zéro de la session n'efface pas l'historique.
+
+## Développement et validation GitHub
+
+Modifier les fichiers de `src/netpulse/`, puis régénérer les exécutables autonomes :
+
+```bash
+python3 tools/build_executables.py
+python3 tools/build_executables.py --check
+python3 -m unittest discover -s tests -v
+node tests/test_extension.cjs
+```
+
+Le workflow `.github/workflows/validate.yml` valide chaque push, pull request et lancement
+manuel : cohérence des exécutables générés, syntaxe, tests Python/Bash/JavaScript,
+construction des widgets GTK dans un affichage Xvfb isolé et contenu du paquet Python.
+Les tests utilisent des doubles des processus et commandes réseau ; aucun proxy réel
+n'est lancé ou arrêté. Le workflow utilise uniquement la permission GitHub `contents: read`.
+
 ## 🏗️ Architecture technique
 
 ```

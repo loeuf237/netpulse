@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netpulse"
-version = "1.0.0"
+version = "1.1.0"
 description = "Moniteur Réseau en Temps Réel, Pare-feu Applicatif 1-Clic et Forçage Proxy TUN pour Linux (GNOME/Libadwaita)"
 readme = "README.md"
 requires-python = ">=3.10"

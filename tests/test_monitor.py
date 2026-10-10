@@ -1,12 +1,14 @@
 import importlib.util
 import json
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'src'))
 spec = importlib.util.spec_from_file_location('netpulse_monitor_test', ROOT / 'src/netpulse/monitor.py')
 monitor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(monitor)
@@ -55,6 +57,25 @@ class MonitorTests(unittest.TestCase):
             self.assertTrue(monitor.NetPulseEngine._ctl_async(engine, 'firewall-init'))
         self.assertIsNone(engine._protected_tunnel)
         spawn.assert_called_once()
+
+    def test_configured_protection_follows_tunnel_and_explicit_unlock_releases_it(self):
+        engine = self.engine()
+        with patch.object(monitor.NetPulseEngine, '_tunnel_identity', return_value=(20, 456)):
+            engine._refresh_protection()
+        self.assertEqual(engine._protected_tunnel, (20, 456))
+        engine.config["connection_protected"] = False
+        engine._refresh_protection()
+        self.assertIsNone(engine._protected_tunnel)
+
+    def test_failed_command_is_reported_before_retry_delay_expires(self):
+        engine = self.engine()
+        process = Mock()
+        process.poll.return_value = 1
+        engine._ctl_jobs = {("block", "42"): (process, 100)}
+        with patch.object(monitor.time, 'time', return_value=101):
+            engine._reap_ctl_jobs()
+        self.assertEqual(engine._ctl_results[("block", "42")], 1)
+        self.assertIn(("block", "42"), engine._ctl_jobs)
 
     def test_resume_recent_session_without_recounting_socket_bytes(self):
         data = {'timestamp': 100, 'session_start': 10, 'session_rx': 500, 'session_tx': 200,
@@ -153,7 +174,9 @@ CLOSE-WAIT 0 0 192.0.2.1:3 198.51.100.3:443 users:(("other",pid=43,fd=3)) ino:12
     def test_blocked_process_remains_visible_without_connections(self):
         payload = self.collect(self.engine(), {}, 2, blocked=True, connections=False)
         self.assertEqual(len(payload['processes']), 1)
-        self.assertTrue(payload['processes'][0]['is_blocked'])
+        self.assertTrue(payload['processes'][0]['block_requested'])
+        self.assertFalse(payload['processes'][0]['is_blocked'])
+        self.assertEqual(payload['processes'][0]['rule_status']['state'], 'pending')
 
     def test_routing_never_reassigns_a_blocked_process(self):
         engine = self.engine()
