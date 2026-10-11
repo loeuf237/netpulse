@@ -1,4 +1,5 @@
 import subprocess
+import shlex
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,24 @@ def heredoc(marker):
 
 
 class InstallerTests(unittest.TestCase):
+    def test_reinstall_restarts_monitor_after_reloading_unit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            commands = INSTALL.split('# 7. Activation', 1)[1].split('\necho\n', 1)[0]
+            commands = commands[commands.index('echo "[7/7]'):]
+            prefix = ('set -e\nSCRIPT_DIR=' + shlex.quote(str(ROOT)) +
+                      '\nSYSTEMD_USER_DIR=' + shlex.quote(directory) +
+                      '\nsystemctl() { printf "systemctl %s\\n" "$*"; }\n')
+            result = subprocess.run(['bash', '-c', prefix + commands],
+                                    check=True, text=True, capture_output=True, timeout=5)
+            calls = [line for line in result.stdout.splitlines() if line.startswith('systemctl ')]
+            self.assertEqual(calls[-3:], ['systemctl --user daemon-reload',
+                                         'systemctl --user enable netpulse-monitor.service',
+                                         'systemctl --user restart netpulse-monitor.service'])
+
+    def test_service_resumes_counters_and_preserves_active_tunnel(self):
+        unit = (ROOT / 'systemd/netpulse-monitor.service').read_text()
+        self.assertIn('ExecStart=%h/.local/bin/netpulse-monitor --resume-session --preserve-active-tunnel', unit)
+
     def test_generated_icons_have_requested_dimensions(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory)

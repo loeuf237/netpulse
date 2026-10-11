@@ -1,5 +1,38 @@
 # Analyse et corrections de NetPulse — 10 octobre 2026
 
+## Complément du 11 octobre 2026
+
+L'erreur d'activation `RTNETLINK answers: No such device` est reproduite dans le
+test de copie des routes directes : `ip route show dev INTERFACE` peut omettre le
+champ `dev` dans sa sortie. La copie vers la table 200 rétablit désormais
+explicitement l'interface si elle est absente, sans la dupliquer si elle existe.
+Les lignes vides sont ignorées et une erreur de copie indique l'étape et l'interface.
+Le correctif a été réinstallé et l'activation du forçage proxy a été confirmée par
+l'utilisateur. Les contrôleurs installés, la GUI, le moniteur et l'unité systemd
+correspondent aux fichiers corrigés du dépôt.
+
+- La sauvegarde GUI refuse une configuration existante invalide au lieu de la
+  remplacer par les valeurs par défaut. Les paramètres numériques des fonctions
+  récentes et l'URL HTTPS sont validés au chargement pour éviter les erreurs GTK.
+- Les diagnostics sont invalidés lorsque le tunnel, le serveur, l'URL HTTPS ou leur
+  activation changent. Un résultat en cours pour l'ancienne connexion est ignoré,
+  et la prochaine sonde démarre sans attendre l'intervalle normal. Les échecs de
+  serveurs différents ne sont plus cumulés pour déclencher une alerte.
+- Les identifiants de profils absents, vides ou dupliqués produisent une erreur de
+  validation. Une URL de diagnostic qui n'est pas du texte ou utilise le port zéro
+  est refusée proprement.
+- La GUI demande aussi une confirmation lorsque le moniteur préserve le tunnel
+  après une mise à jour, même si la configuration est déverrouillée.
+- Une réinstallation redémarre effectivement le moniteur déjà actif. L'unité
+  systemd reprend les statistiques récentes et préserve le tunnel existant ; la mise
+  à jour à chaud réutilise cette unité sans dupliquer ses arguments.
+
+Validation locale : **96 tests Python/Bash et 9 tests JavaScript réussis**, cohérence
+des exécutables générés, syntaxe Python/Bash/JavaScript et `git diff --check`.
+Le paquet `netpulse-1.1.0-py3-none-any.whl` a été construit sans téléchargement de
+dépendances et son contenu vérifié. Le test complet des widgets avec Xvfb n'a pas
+été exécuté localement : Xvfb est absent ; le workflow GitHub conserve cette vérification.
+
 L'analyse a couvert les sources Python et Bash, leurs copies exécutables dans `bin/`, l'extension GNOME, les scripts d'installation et de désinstallation, le packaging, les fichiers desktop/systemd et la documentation. Le binaire tiers `tun2socks` a été vérifié par son aide ; son code source n'est pas présent dans ce dépôt.
 
 Les modifications locales présentes au départ ont été conservées. Leur copie préalable est disponible dans `/tmp/netpulse-audit-original` pour la durée de vie de cet environnement. Aucun service NetPulse n'a été arrêté, aucune interface TUN créée ou supprimée et aucune règle réseau réelle modifiée pendant cette intervention. Les corrections sont enregistrées dans le dépôt ; l'installation active n'a pas été remplacée.

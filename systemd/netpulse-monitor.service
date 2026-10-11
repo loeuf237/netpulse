@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/netpulse-monitor
+ExecStart=%h/.local/bin/netpulse-monitor --resume-session --preserve-active-tunnel
 Restart=on-failure
 RestartSec=3
 

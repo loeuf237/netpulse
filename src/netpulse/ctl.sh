@@ -461,9 +461,18 @@ split_setup_rules() {
     # Copier les routes physiques avant d'installer la passerelle de la table 200.
     if [ -n "$default_if" ]; then
         while IFS= read -r route; do
+            [ -n "$route" ] || continue
             [[ "$route" == default* ]] && continue
             read -r -a route_args <<< "$route"
-            ip route replace "${route_args[@]}" table 200 || return 1
+            # iproute2 omet « dev » lorsque l'affichage est filtré par interface.
+            # Le rétablir avant de réutiliser la route dans une autre table.
+            if [[ " $route " != *" dev "* ]]; then
+                route_args+=(dev "$default_if")
+            fi
+            ip route replace "${route_args[@]}" table 200 || {
+                echo "Erreur: copie de la route directe vers la table 200 impossible (interface $default_if)." >&2
+                return 1
+            }
         done < <(ip -4 route show dev "$default_if")
     fi
     if [ -n "$default_gw" ] && [ -n "$default_if" ]; then

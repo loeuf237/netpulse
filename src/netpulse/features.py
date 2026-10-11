@@ -31,6 +31,14 @@ FEATURE_DEFAULTS = {
     "alert_cooldown_sec": 600,
 }
 
+FEATURE_LIMITS = {
+    "diagnostic_interval": (30, 600),
+    "history_retention_days": (1, 365),
+    "alert_daily_mib": (0, 10_000_000),
+    "alert_app_rate_mib": (0, 100_000),
+    "alert_cooldown_sec": (30, 86400),
+}
+
 
 def state_dir():
     return Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "netpulse"
@@ -60,6 +68,17 @@ def bounded_number(config, key, minimum, maximum):
         return FEATURE_DEFAULTS[key]
 
 
+def normalize_feature_config(config):
+    config = dict(config)
+    for key, (minimum, maximum) in FEATURE_LIMITS.items():
+        config[key] = bounded_number(config, key, minimum, maximum)
+    try:
+        validate_diagnostic_url(config.get("diagnostic_url", FEATURE_DEFAULTS["diagnostic_url"]))
+    except ValueError:
+        config["diagnostic_url"] = FEATURE_DEFAULTS["diagnostic_url"]
+    return config
+
+
 def proxy_display(url):
     """Never expose credentials in diagnostics, profile descriptions or history."""
     try:
@@ -83,11 +102,14 @@ def validate_proxy(url):
 
 
 def validate_diagnostic_url(url):
+    if not isinstance(url, str):
+        raise ValueError("Le diagnostic nécessite une URL HTTPS sans identifiants.")
     parsed = urllib.parse.urlsplit(url)
     if (len(url) > 2048 or any(c.isspace() for c in url) or parsed.scheme != "https"
             or not parsed.hostname or parsed.username is not None or parsed.password is not None):
         raise ValueError("Le diagnostic nécessite une URL HTTPS sans identifiants.")
-    parsed.port  # validate the port, too
+    if parsed.port == 0:
+        raise ValueError("Le port HTTPS doit être compris entre 1 et 65535.")
     return url
 
 
@@ -277,6 +299,9 @@ class AlertEngine:
 
     def evaluate(self, payload, diagnostics, daily_total, config):
         events = []
+        if not payload.get("proxy_active") or not diagnostics:
+            self.server_failures = 0
+            self.server_sample = None
         fresh = diagnostics.get("timestamp") is not None and diagnostics.get("timestamp") != self.server_sample
         if fresh:
             self.server_sample = diagnostics.get("timestamp")
@@ -315,29 +340,38 @@ class FeatureService:
         self.events = []
         self.error = ""
         self._probe_running = False
-        self._last_probe = 0
+        self._last_probe = None
+        self._probe_context = None
         self._generation = 0
         self._request_key = None
         self._connection_state = None
+        self._alert_context = None
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
     def submit(self, payload, rx, tx, applications, config, proxy_url=""):
+        enabled = config.get("diagnostics_enabled", True)
+        url = config.get("diagnostic_url", "https://github.com")
+        context = (enabled, bool(payload["proxy_active"]), proxy_url, url)
+        with self.lock:
+            if context != self._probe_context:
+                self._probe_context = context
+                self.diagnostics = {}
+                self._generation += 1
+                self._last_probe = None
         try:
-            self.jobs.put_nowait((payload, rx, tx, applications, dict(config)))
+            self.jobs.put_nowait((payload, rx, tx, applications, dict(config), context))
         except queue.Full:
             with self.lock:
                 self.error = "L'historique n'a pas pu enregistrer certains relevés : file saturée."
         interval = bounded_number(config, "diagnostic_interval", 30, 600)
-        enabled = config.get("diagnostics_enabled", True)
         with self.lock:
             if not enabled:
-                self.diagnostics = {}
-                self._generation += 1
                 return
             request = config.get("diagnostic_request")
             force = request is not None and request != self._request_key
-            if self._probe_running or time.monotonic() - self._last_probe < (5 if force else interval):
+            if self._probe_running or (self._last_probe is not None and
+                    time.monotonic() - self._last_probe < (5 if force else interval)):
                 return
             self._request_key = request
             self._probe_running = True
@@ -345,8 +379,7 @@ class FeatureService:
             generation = self._generation
         def probe():
             try:
-                result = DiagnosticProbe().run(payload["proxy_active"], proxy_url,
-                                               config.get("diagnostic_url", "https://github.com"))
+                result = DiagnosticProbe().run(context[1], proxy_url, url)
                 with self.lock:
                     if generation == self._generation:
                         self.diagnostics = result
@@ -363,7 +396,7 @@ class FeatureService:
                     return
                 if self.store is None:
                     self.store = HistoryStore()
-                payload, rx, tx, apps, config = job
+                payload, rx, tx, apps, config, context = job
                 retention = bounded_number(config, "history_retention_days", 1, 365)
                 self.store.record(payload["timestamp"], rx, tx, apps, retention)
                 active = bool(payload["proxy_active"])
@@ -373,7 +406,11 @@ class FeatureService:
                                          payload["timestamp"])
                 self._connection_state = active
                 with self.lock:
-                    diagnostics = dict(self.diagnostics)
+                    diagnostics = dict(self.diagnostics) if context == self._probe_context else {}
+                if context != self._alert_context:
+                    self.alerts.server_failures = 0
+                    self.alerts.server_sample = None
+                    self._alert_context = context
                 daily_total = self.store.daily_total() if bounded_number(config, "alert_daily_mib", 0, 10_000_000) else 0
                 for kind, key, message, cooldown in self.alerts.evaluate(
                         payload, diagnostics, daily_total, config):
@@ -444,11 +481,14 @@ class ProfileStore:
         if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("profiles"), list):
             raise ValueError("Le fichier de profils est invalide.")
         result = []
+        ids = set()
         for profile in data["profiles"]:
             valid = self.validate(profile)
-            valid["id"] = profile["id"]
-            if not isinstance(valid["id"], str) or len(valid["id"]) > 64:
+            valid["id"] = profile.get("id")
+            if (not isinstance(valid["id"], str) or not valid["id"] or len(valid["id"]) > 64
+                    or valid["id"] in ids):
                 raise ValueError("Identifiant de profil invalide.")
+            ids.add(valid["id"])
             result.append(valid)
         return result
 

@@ -206,6 +206,9 @@ Le script `install.sh` s'occupe de tout :
 5. Active l'indicateur GNOME Shell dans votre barre supérieure.
 6. Démarre automatiquement le service d'arrière-plan `netpulse-monitor.service`.
 
+Lors d'une réinstallation, le moniteur est redémarré pour charger les nouveaux
+exécutables. Il reprend les compteurs récents et préserve un éventuel tunnel actif.
+
 ---
 
 ## 💻 Utilisation

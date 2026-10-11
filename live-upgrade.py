@@ -167,9 +167,7 @@ def main():
         for name in ("netpulse-monitor", "netpulse-gui"):
             atomic_write(BIN / name, (ROOT / "bin" / name).read_bytes(), 0o755)
         # La protection reste présente si systemd doit relancer le moniteur.
-        service = (ROOT / "systemd/netpulse-monitor.service").read_text().replace(
-            "ExecStart=%h/.local/bin/netpulse-monitor",
-            "ExecStart=%h/.local/bin/netpulse-monitor --resume-session --preserve-active-tunnel")
+        service = (ROOT / "systemd/netpulse-monitor.service").read_text()
         atomic_write(unit, service.encode())
         executable = str(BIN / "netpulse-gui")
         for old, new in (("\\", "\\\\"), ('"', '\\"'), ("`", "\\`"), ("$", "\\$"), ("%", "%%")):

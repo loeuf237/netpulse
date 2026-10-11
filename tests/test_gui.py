@@ -99,6 +99,35 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(path.read_text(), original)
             self.assertEqual(len(list(Path(directory).iterdir())), 1)
 
+    def test_config_save_preserves_malformed_existing_file(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(gui, 'CONFIG_PATH', str(Path(directory) / 'config.json')):
+            path = Path(gui.CONFIG_PATH)
+            for content in ('{broken', '[]', 'null'):
+                path.write_text(content)
+                self.assertFalse(gui.save_config({'refresh_interval': 2}))
+                self.assertEqual(path.read_text(), content)
+
+    def test_deferred_tunnel_requires_confirmation_even_with_unlocked_config(self):
+        fake = SimpleNamespace(config={'connection_protected': False},
+                               latest_stats={'network_actions_deferred': True},
+                               _network_dialog=None, _closed=False, _poll_stats=Mock())
+        callback = Mock()
+        with patch.object(gui.Adw.MessageDialog, 'new', return_value=Mock()) as create:
+            gui.NetPulseWindow._confirm_network_action(fake, 'Tunnel conservé', callback)
+        callback.assert_not_called()
+        create.assert_called_once()
+
+    def test_invalid_numeric_feature_settings_are_normalized_on_load(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(gui, 'CONFIG_PATH', str(Path(directory) / 'config.json')):
+            path = Path(gui.CONFIG_PATH)
+            for value in (None, 'bad', 'NaN', 'Infinity'):
+                path.write_text(json.dumps({'diagnostic_interval': value, 'alert_daily_mib': value,
+                                            'diagnostic_url': value}))
+                config = gui.load_config()
+                self.assertEqual(config['diagnostic_interval'], 60)
+                self.assertEqual(config['alert_daily_mib'], 0)
+                self.assertEqual(config['diagnostic_url'], 'https://github.com')
+
     def test_stale_monitor_pid_starts_monitor(self):
         fake = SimpleNamespace(mon_bin='/test/netpulse-monitor')
         with patch.object(gui.os.path, 'exists', return_value=True), \

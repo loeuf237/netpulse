@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -109,6 +110,16 @@ class ProfileTests(unittest.TestCase):
                 self.store.save(dict(self.profile, **values))
             self.assertEqual(self.store.path.read_bytes(), original)
 
+    def test_corrupt_profile_ids_are_reported_as_validation_errors(self):
+        for ids in ([None], [''], ['same', 'same']):
+            profiles = [dict(self.profile, id=value) for value in ids]
+            self.store.path.write_text(json.dumps({'version': 1, 'profiles': profiles}))
+            with self.assertRaises(ValueError):
+                self.store.list()
+        self.store.path.write_text(json.dumps({'version': 1, 'profiles': [self.profile]}))
+        with self.assertRaises(ValueError):
+            self.store.list()
+
     def test_atomic_failure_keeps_previous_profiles_and_removes_temporary_file(self):
         self.store.save(self.profile)
         original = self.store.path.read_bytes()
@@ -196,9 +207,14 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(result["tunnel"]["state"], "inactive")
 
     def test_rejects_non_https_and_credentialed_endpoints(self):
-        for url in ("http://example.org", "file:///etc/passwd", "https://user:secret@example.org"):
+        for url in (None, 42, {}, "https://example.org:0", "http://example.org", "file:///etc/passwd", "https://user:secret@example.org"):
             with self.assertRaises(ValueError):
                 validate_diagnostic_url(url)
+
+    def test_invalid_config_url_does_not_crash_probe(self):
+        for url in (None, 42, {}):
+            result = DiagnosticProbe().run(False, '', url)
+            self.assertEqual(result['internet']['state'], 'error')
 
 
 class AlertTests(unittest.TestCase):
@@ -219,6 +235,13 @@ class AlertTests(unittest.TestCase):
                 events = engine.evaluate({"timestamp": time.time(), "proxy_active": active},
                                          {"timestamp": timestamp, "server": {"state": "error"}}, 0, config)
                 self.assertEqual(events, [])
+
+    def test_diagnostic_reset_breaks_consecutive_server_failures(self):
+        engine = AlertEngine()
+        payload = {'timestamp': time.time(), 'proxy_active': True}
+        self.assertEqual(engine.evaluate(payload, {'timestamp': 1, 'server': {'state': 'error'}}, 0, {}), [])
+        self.assertEqual(engine.evaluate(payload, {}, 0, {}), [])
+        self.assertEqual(engine.evaluate(payload, {'timestamp': 2, 'server': {'state': 'error'}}, 0, {}), [])
 
     def test_quota_and_sustained_app_rate_are_alerts_only(self):
         engine = AlertEngine()
@@ -241,6 +264,43 @@ class AlertTests(unittest.TestCase):
 
 
 class ServiceTests(unittest.TestCase):
+    def test_result_from_previous_tunnel_is_discarded(self):
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        def probe(*args):
+            started.set()
+            release.wait(2)
+            finished.set()
+            return {'timestamp': 1, 'server': {'state': 'error'}}
+        store = Mock()
+        store.recent_events.return_value = []
+        service = FeatureService(store=store)
+        self.addCleanup(service.close)
+        self.addCleanup(release.set)
+        with patch('netpulse.features.DiagnosticProbe.run', side_effect=probe):
+            service.submit({'timestamp': time.time(), 'proxy_active': True}, 0, 0, [], {}, 'socks5://old:1080')
+            self.assertTrue(started.wait(1))
+            service.submit({'timestamp': time.time(), 'proxy_active': True}, 0, 0, [], {}, 'socks5://new:1080')
+            release.set()
+            self.assertTrue(finished.wait(1))
+            # Synchronize with publication after the probe returned.
+            deadline = time.monotonic() + 1
+            while service._probe_running and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertEqual(service.snapshot()['diagnostics'], {})
+
+    def test_reenable_diagnostics_schedules_new_probe_immediately(self):
+        store = Mock()
+        store.recent_events.return_value = []
+        service = FeatureService(store=store)
+        self.addCleanup(service.close)
+        service._last_probe = time.monotonic()
+        payload = {'timestamp': time.time(), 'proxy_active': False}
+        service.submit(payload, 0, 0, [], {'diagnostics_enabled': False})
+        started = threading.Event()
+        with patch('netpulse.features.DiagnosticProbe.run', side_effect=lambda *args: started.set() or {}):
+            service.submit(payload, 0, 0, [], {'diagnostics_enabled': True})
+            self.assertTrue(started.wait(0.2))
+
     def test_quota_uses_global_history_and_deduplication_survives_service_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             store = HistoryStore(Path(directory) / "history.db")

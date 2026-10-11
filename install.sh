@@ -125,7 +125,8 @@ rm -f "$SYSTEMD_USER_DIR/default.target.wants/force-proxy-monitor.service"
 
 cp "$SCRIPT_DIR/systemd/netpulse-monitor.service" "$SYSTEMD_USER_DIR/netpulse-monitor.service"
 systemctl --user daemon-reload
-systemctl --user enable --now netpulse-monitor.service
+systemctl --user enable netpulse-monitor.service
+systemctl --user restart netpulse-monitor.service
 
 echo
 echo "=========================================================="

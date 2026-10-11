@@ -26,7 +26,7 @@ import fcntl
 import ipaddress
 from collections import deque
 import psutil
-from netpulse.features import FEATURE_DEFAULTS, FeatureService, proxy_display, rule_state
+from netpulse.features import FEATURE_DEFAULTS, FeatureService, normalize_feature_config, proxy_display, rule_state
 
 # Nom de processus propre pour GNOME System Monitor ("Ressources")
 try:
@@ -137,7 +137,7 @@ def load_config():
                 interval = config.get("refresh_interval")
                 if type(interval) is not int or interval not in (1, 2, 3):
                     config["refresh_interval"] = 1
-                return config
+                return normalize_feature_config(config)
     except Exception:
         pass
     return DEFAULT_CONFIG.copy()

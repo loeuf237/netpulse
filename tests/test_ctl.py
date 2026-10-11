@@ -113,6 +113,40 @@ class ControllerTests(unittest.TestCase):
         ensure_policy_rule 0x1000/0x1000 100 10040'''
         self.assertEqual(self.run_functions(commands).stdout, '')
 
+    def test_direct_routes_keep_interface_when_filtered_ip_output_omits_dev(self):
+        self.config.write_text('{"bypass_ftp":false}')
+        commands = '''get_net_info() { default_if=wlp0s20f3; default_gw=192.168.43.1; default_ip=192.168.43.226; };
+        iptables() { :; }; ip6tables() { :; }; ensure_policy_rule() { :; };
+        ip() {
+            if [ "$*" = "-4 route show dev wlp0s20f3" ]; then
+                printf '%s\\n' 'default via 192.168.43.1 proto dhcp src 192.168.43.226 metric 600' \
+                              '192.168.43.0/24 proto kernel scope link src 192.168.43.226 metric 600';
+            elif [ "$1 $2" = "route replace" ]; then
+                if [[ " $* " != *" dev "* ]]; then
+                    echo 'RTNETLINK answers: No such device' >&2; return 1;
+                fi
+                printf '%s\\n' "$*";
+            fi
+        };
+        split_setup_rules'''
+        result = self.run_functions(commands)
+        self.assertIn('route replace 192.168.43.0/24 proto kernel scope link src 192.168.43.226 metric 600 dev wlp0s20f3 table 200',
+                      result.stdout.splitlines())
+
+    def test_direct_routes_do_not_duplicate_explicit_interface(self):
+        self.config.write_text('{"bypass_ftp":false}')
+        commands = '''get_net_info() { default_if=wlp0s20f3; default_gw=192.168.43.1; default_ip=192.168.43.226; };
+        iptables() { :; }; ip6tables() { :; }; ensure_policy_rule() { :; };
+        ip() {
+            if [ "$*" = "-4 route show dev wlp0s20f3" ]; then
+                echo '192.168.43.0/24 dev wlp0s20f3 proto kernel scope link src 192.168.43.226';
+            elif [ "$1 $2" = "route replace" ]; then printf '%s\\n' "$*"; fi
+        };
+        split_setup_rules'''
+        result = self.run_functions(commands)
+        self.assertIn('route replace 192.168.43.0/24 dev wlp0s20f3 proto kernel scope link src 192.168.43.226 table 200',
+                      result.stdout.splitlines())
+
     def test_kill_sockets_uses_exact_owner_and_endpoint_filters(self):
         mock_bin = self.directory / 'bin'
         mock_bin.mkdir()

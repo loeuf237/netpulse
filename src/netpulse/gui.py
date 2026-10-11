@@ -18,7 +18,7 @@ import ctypes
 import tempfile
 import datetime
 from netpulse.features import (FEATURE_DEFAULTS, HistoryStore, ProfileStore, activate_profile,
-                              proxy_display, validate_diagnostic_url)
+                              normalize_feature_config, proxy_display, validate_diagnostic_url)
 import cairo
 import gi
 
@@ -94,7 +94,7 @@ def load_config():
                 interval = cfg.get("refresh_interval")
                 if type(interval) is not int or interval not in (1, 2, 3):
                     cfg["refresh_interval"] = 1
-                return cfg
+                return normalize_feature_config(cfg)
     except Exception:
         pass
     return default_cfg
@@ -104,7 +104,14 @@ def save_config(cfg):
     tmp_path = None
     try:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        updated = {**load_config(), **cfg}
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as stream:
+                existing = json.load(stream)
+        except FileNotFoundError:
+            existing = {}
+        if not isinstance(existing, dict):
+            raise ValueError("La configuration doit être un objet JSON.")
+        updated = {**load_config(), **existing, **cfg}
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(CONFIG_PATH), delete=False) as f:
             tmp_path = f.name
             json.dump(updated, f, indent=2)
@@ -301,7 +308,8 @@ class NetPulseWindow(Adw.ApplicationWindow):
                                      lambda: self._execute_ctl_action(args, success_message))
 
     def _confirm_network_action(self, title, callback, always=False):
-        protected = self.config.get("connection_protected", True)
+        protected = (self.config.get("connection_protected", True) or
+                     self.latest_stats.get("network_actions_deferred", False))
         if not always and not protected:
             callback()
             return
