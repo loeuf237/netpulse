@@ -3,11 +3,10 @@ import sys
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
-from netpulse.features import DiagnosticProbe, HistoryStore, ProfileStore, rule_state
+from netpulse.features import HistoryStore, ProfileStore, rule_state
 
 
 class EnglishInterfaceTests(unittest.TestCase):
@@ -36,8 +35,10 @@ class EnglishInterfaceTests(unittest.TestCase):
 
     def test_user_visible_python_text_has_no_untranslated_french_diacritics(self):
         # Ignore docstrings; inspect runtime literals, including f-string fragments.
-        for file in ('gui.py', 'features.py', 'monitor.py'):
-            tree = ast.parse((ROOT / 'src/netpulse' / file).read_text())
+        files = [ROOT / 'src/netpulse' / name for name in ('gui.py', 'features.py', 'monitor.py')]
+        files.append(ROOT / 'live-upgrade.py')
+        for file in files:
+            tree = ast.parse(file.read_text())
             docstrings = set()
             for node in ast.walk(tree):
                 if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -45,4 +46,4 @@ class EnglishInterfaceTests(unittest.TestCase):
                         docstrings.add(id(node.body[0].value))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
-                    self.assertNotRegex(node.value, '[éèêàâçîïôùûÉÈÀÇ]', file + ':' + str(node.lineno))
+                    self.assertNotRegex(node.value, '[éèêàâçîïôùûÉÈÀÇ]', str(file) + ':' + str(node.lineno))

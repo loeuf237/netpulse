@@ -3,6 +3,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -152,7 +153,7 @@ class ControllerTests(unittest.TestCase):
         mock_bin.mkdir()
         log = self.directory / 'ss_calls.jsonl'
         fake_ss = mock_bin / 'ss'
-        fake_ss.write_text('''#!/usr/bin/python3
+        fake_ss.write_text('#!' + sys.executable + '''
 import json,sys
 if '-K' not in sys.argv:
     print('ESTAB 0 0 192.0.2.1:1234 198.51.100.1:443 users:(("app",pid=42,fd=3))')

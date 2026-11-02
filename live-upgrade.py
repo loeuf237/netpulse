@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mettre à jour une installation existante sans relancer le tunnel ni fermer sa GUI."""
+"""Upgrade an existing installation without restarting its tunnel or closing its interface."""
 import json
 import os
 import shutil
@@ -43,7 +43,7 @@ def active_tunnel():
                 return process
         except (OSError, ValueError, psutil.Error):
             pass
-    raise RuntimeError("Aucun tunnel actif : utiliser install.sh pour une installation normale.")
+    raise RuntimeError("No active tunnel: use install.sh for a fresh installation.")
 
 
 def network_snapshot():
@@ -58,9 +58,9 @@ def network_snapshot():
 
 def verify_network(tunnel, identity, baseline):
     if not tunnel.is_running() or tunnel.create_time() != identity:
-        raise RuntimeError("Le processus du tunnel a changé pendant la mise à jour.")
+        raise RuntimeError("The tunnel process changed during the upgrade.")
     if network_snapshot() != baseline:
-        raise RuntimeError("Les routes, règles ou paramètres TUN ont changé ; aucune restauration réseau automatique.")
+        raise RuntimeError("Routes, rules or TUN settings changed; network state will not be restored automatically.")
 
 
 def wait_for_stats(old_timestamp, timeout=10):
@@ -74,7 +74,7 @@ def wait_for_stats(old_timestamp, timeout=10):
         except (OSError, ValueError, KeyError):
             pass
         time.sleep(0.2)
-    raise RuntimeError("Le nouveau moniteur n'a pas publié de statistiques protégées.")
+    raise RuntimeError("The new monitor did not publish protected statistics.")
 
 
 def busy_children(process):
@@ -89,14 +89,14 @@ def busy_children(process):
 
 def main():
     if os.getuid() == 0:
-        raise RuntimeError("Lancer avec l'utilisateur de session, pas avec sudo.")
+        raise RuntimeError("Run as your desktop user, without sudo.")
     tunnel = active_tunnel()
     identity = tunnel.create_time()
     baseline = network_snapshot()
     old_monitor = psutil.Process(int(MONITOR_PID.read_text().strip()))
     if (old_monitor.uids().real != os.getuid() or old_monitor.name() != "netpulse-mon"
             or str(BIN / "netpulse-monitor") not in old_monitor.cmdline()):
-        raise RuntimeError("Le PID du moniteur ne correspond pas à l'installation attendue.")
+        raise RuntimeError("The monitor PID does not match the expected installation.")
     guis = []
     for process in psutil.process_iter(["name", "cmdline", "uids"]):
         if (process.info["name"] == "netpulse" and process.info["uids"].real == os.getuid()
@@ -111,7 +111,7 @@ def main():
 
     helper = PRIVILEGED if PRIVILEGED.exists() else BIN / "netpulse-ctl"
     if PRIVILEGED.exists() and PRIVILEGED.read_bytes() != (ROOT / "bin/netpulse-ctl").read_bytes():
-        raise RuntimeError("Installer d'abord le contrôleur root mis à jour avec sudo install, sans relancer le proxy.")
+        raise RuntimeError("First update the root controller with sudo install, without restarting the proxy.")
     command("sudo", "-n", str(helper), "check-sudo", env=env)
     command("bash", "-n", str(ROOT / "bin/netpulse-ctl"))
     for name in ("netpulse-monitor", "netpulse-gui"):
@@ -138,8 +138,8 @@ def main():
     (backup / "manifest.json").write_text(json.dumps(manifest, indent=2))
     (backup / "network-before.json").write_text(json.dumps(baseline, indent=2))
     (backup / "stats-before.json").write_text(json.dumps(old_stats))
-    print(f"Sauvegarde : {backup}", flush=True)
-    print(f"Tunnel conservé : PID {tunnel.pid}. Mise à jour du moniteur uniquement.", flush=True)
+    print(f"Backup: {backup}", flush=True)
+    print(f"Tunnel preserved: PID {tunnel.pid}. Updating the monitor only.", flush=True)
 
     monitor_stopped = False
     service_started = False
@@ -149,12 +149,12 @@ def main():
         while busy_children(old_monitor) and time.monotonic() < deadline:
             time.sleep(0.1)
         if busy_children(old_monitor):
-            raise RuntimeError("Une commande du moniteur est en cours ; réessayer après sa fin.")
+            raise RuntimeError("A monitor command is still running; retry after it finishes.")
         unit_pid = int(command("systemctl", "--user", "show", "-p", "MainPID", "--value",
                                "netpulse-monitor.service", env=env).strip())
         if unit_pid == old_monitor.pid:
             if any(line.startswith(("ExecStop=", "ExecStopPost=")) for line in unit.read_text().splitlines()):
-                raise RuntimeError("Le service contient une commande d'arrêt personnalisée : mise à jour interrompue.")
+                raise RuntimeError("The service contains a custom stop command: upgrade aborted.")
             command("systemctl", "--user", "stop", "netpulse-monitor.service", env=env)
         else:
             old_monitor.terminate()
@@ -184,9 +184,9 @@ def main():
         stats = wait_for_stats(old_stats["timestamp"])
         new_pid = int(MONITOR_PID.read_text().strip())
         if new_pid == old_monitor.pid:
-            raise RuntimeError("Le moniteur n'a pas changé de processus.")
+            raise RuntimeError("The monitor process was not replaced.")
         if stats["session_start"] != old_stats["session_start"]:
-            raise RuntimeError("La session de statistiques n'a pas été reprise.")
+            raise RuntimeError("The statistics session was not resumed.")
         verify_network(tunnel, identity, baseline)
     except Exception:
         # Revenir aux fichiers précédents, sans aucune commande proxy/pare-feu/routage.
@@ -216,10 +216,10 @@ def main():
         command(*arguments, str(BIN / "netpulse-gui"), "--new-instance", env=env)
         time.sleep(2)
         if command("systemctl", "--user", "is-active", gui_unit, env=env).strip() != "active":
-            raise RuntimeError(f"L'interface mise à jour n'a pas démarré ; diagnostic : journalctl --user -u {gui_unit}")
+            raise RuntimeError(f"The updated interface did not start; check: journalctl --user -u {gui_unit}")
     for gui in guis:
         if not gui.is_running():
-            raise RuntimeError("Une ancienne interface a été fermée pendant la mise à jour.")
+            raise RuntimeError("An existing interface was closed during the upgrade.")
     verify_network(tunnel, identity, baseline)
     report = {"tunnel_pid": tunnel.pid, "tunnel_create_time": identity, "monitor_pid": new_pid,
               "old_gui_pids": [gui.pid for gui in guis], "routes_unchanged": True,
