@@ -85,31 +85,31 @@ def proxy_display(url):
         parsed = urllib.parse.urlsplit(url)
         host = parsed.hostname or ""
         host = "[" + host + "]" if ":" in host else host
-        return f"{parsed.scheme}://{host}:{parsed.port}" if host and parsed.port else "Non configuré"
+        return f"{parsed.scheme}://{host}:{parsed.port}" if host and parsed.port else "Not configured"
     except (ValueError, TypeError):
-        return "Non configuré"
+        return "Not configured"
 
 
 def validate_proxy(url):
     if not isinstance(url, str) or len(url) > 2048 or any(c.isspace() for c in url):
-        raise ValueError("L'URL du proxy est invalide.")
+        raise ValueError("Invalid proxy URL.")
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("socks5", "socks4", "http") or not parsed.hostname or not parsed.port:
-        raise ValueError("Utiliser socks5://hôte:port, socks4://hôte:port ou http://hôte:port.")
+        raise ValueError("Use socks5://host:port, socks4://host:port or http://host:port.")
     if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-        raise ValueError("Le proxy ne doit pas contenir de chemin, de requête ou de fragment.")
+        raise ValueError("The proxy URL must not contain a path, query or fragment.")
     return url
 
 
 def validate_diagnostic_url(url):
     if not isinstance(url, str):
-        raise ValueError("Le diagnostic nécessite une URL HTTPS sans identifiants.")
+        raise ValueError("Diagnostics require an HTTPS URL without credentials.")
     parsed = urllib.parse.urlsplit(url)
     if (len(url) > 2048 or any(c.isspace() for c in url) or parsed.scheme != "https"
             or not parsed.hostname or parsed.username is not None or parsed.password is not None):
-        raise ValueError("Le diagnostic nécessite une URL HTTPS sans identifiants.")
+        raise ValueError("Diagnostics require an HTTPS URL without credentials.")
     if parsed.port == 0:
-        raise ValueError("Le port HTTPS doit être compris entre 1 et 65535.")
+        raise ValueError("The HTTPS port must be between 1 and 65535.")
     return url
 
 
@@ -213,14 +213,14 @@ class HistoryStore:
         try:
             with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as stream:
                 writer = csv.writer(stream)
-                writer.writerow(["date_locale", "portee", "application", "octets_recus", "octets_envoyes"])
+                writer.writerow(["local_date", "scope", "application", "bytes_received", "bytes_sent"])
                 for row in rows:
                     name = row["app"]
                     if name.startswith(("=", "+", "-", "@", "\t", "\r")):
                         name = "'" + name
                     writer.writerow([dt.datetime.fromtimestamp(row["bucket"]).astimezone().isoformat(),
-                                     "TCP echantillonne" if row["app"] else "Global TCP+UDP",
-                                     name or "Toutes les interfaces physiques", row["rx"], row["tx"]])
+                                     "Sampled TCP" if row["app"] else "Global TCP+UDP",
+                                     name or "All physical interfaces", row["rx"], row["tx"]])
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
@@ -241,20 +241,20 @@ class DiagnosticProbe:
     def run(self, proxy_active, proxy_url, url="https://github.com"):
         result = {"timestamp": time.time(),
                   "tunnel": {"state": "ok" if proxy_active else "inactive",
-                             "detail": "Tunnel actif" if proxy_active else "Tunnel inactif"}}
+                             "detail": "Tunnel active" if proxy_active else "Tunnel inactive"}}
         try:
             url = validate_diagnostic_url(url)
         except (ValueError, TypeError):
-            result["dns"] = result["internet"] = {"state": "error", "detail": "URL HTTPS invalide"}
-            result["server"] = {"state": "unknown", "detail": "Diagnostic non effectué"}
+            result["dns"] = result["internet"] = {"state": "error", "detail": "Invalid HTTPS URL"}
+            result["server"] = {"state": "unknown", "detail": "Diagnostics not performed"}
             return result
         host = urllib.parse.urlsplit(url).hostname
         try:
             socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-            result["dns"] = {"state": "ok", "detail": f"{host} résolu"}
+            result["dns"] = {"state": "ok", "detail": f"{host} resolved"}
         except OSError:
-            result["dns"] = {"state": "error", "detail": f"Résolution de {host} impossible"}
-        result["server"] = {"state": "unknown", "detail": "Aucun serveur actif"}
+            result["dns"] = {"state": "error", "detail": f"Could not resolve {host}"}
+        result["server"] = {"state": "unknown", "detail": "No active server"}
         if proxy_active and proxy_url:
             try:
                 parsed = urllib.parse.urlsplit(validate_proxy(proxy_url))
@@ -264,18 +264,18 @@ class DiagnosticProbe:
                 result["server"] = {"state": "ok", "detail": proxy_display(proxy_url),
                                     "latency_ms": round((time.monotonic() - start) * 1000, 1)}
             except (OSError, ValueError):
-                result["server"] = {"state": "error", "detail": "Serveur proxy TCP inaccessible"}
+                result["server"] = {"state": "error", "detail": "Proxy server TCP inaccessible"}
         start = time.monotonic()
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), HttpsRedirect())
             with opener.open(urllib.request.Request(url, method="HEAD"), timeout=5) as response:
                 status = response.status
-            result["internet"] = {"state": "ok", "detail": f"HTTPS : HTTP {status}"}
+            result["internet"] = {"state": "ok", "detail": f"HTTPS: HTTP {status}"}
         except urllib.error.HTTPError as exc:
             # A HTTP response proves HTTPS connectivity, even if the endpoint rejects HEAD.
-            result["internet"] = {"state": "warning", "detail": f"HTTPS répond : HTTP {exc.code}"}
+            result["internet"] = {"state": "warning", "detail": f"HTTPS responding: HTTP {exc.code}"}
         except (OSError, ValueError):
-            result["internet"] = {"state": "error", "detail": "La requête HTTPS a échoué"}
+            result["internet"] = {"state": "error", "detail": "The HTTPS request failed"}
         result["internet"]["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
         result["endpoint"] = url
         return result
@@ -283,12 +283,12 @@ class DiagnosticProbe:
 
 def rule_state(desired, actual, deferred=False, failed=False):
     if failed and desired != actual:
-        return {"state": "error", "label": "En erreur", "detail": "La commande a échoué ; l'affectation reste différente."}
+        return {"state": "error", "label": "Error", "detail": "The command failed; the observed assignment still differs."}
     if desired != actual:
-        return {"state": "pending", "label": "En attente",
-                "detail": "Connexion protégée : affectation différée." if deferred else "Affectation pas encore constatée."}
-    return {"state": "applied", "label": "Appliquée",
-            "detail": "Affectation constatée dans le noyau. Les sockets déjà ouvertes peuvent garder leur trajet."}
+        return {"state": "pending", "label": "Pending",
+                "detail": "Connection protected: assignment deferred." if deferred else "Assignment not yet observed."}
+    return {"state": "applied", "label": "Applied",
+            "detail": "Assignment observed in the kernel. Existing sockets may retain their previous route."}
 
 
 class AlertEngine:
@@ -309,11 +309,11 @@ class AlertEngine:
             self.server_failures = self.server_failures + 1 if failed else 0
         cooldown = bounded_number(config, "alert_cooldown_sec", 30, 86400)
         if fresh and config.get("alert_server_down", True) and self.server_failures >= 2:
-            events.append(("server", "proxy", "Le serveur proxy est inaccessible sur deux diagnostics successifs.", cooldown))
+            events.append(("server", "proxy", "The proxy server was unreachable on two consecutive checks.", cooldown))
         quota = bounded_number(config, "alert_daily_mib", 0, 10_000_000) * 1024**2
         if quota and daily_total >= quota:
             day = dt.datetime.fromtimestamp(payload["timestamp"]).astimezone().date().isoformat()
-            events.append(("quota", day, "Le seuil de consommation quotidienne a été atteint.", 86400))
+            events.append(("quota", day, "The daily data usage threshold has been reached.", 86400))
         threshold = bounded_number(config, "alert_app_rate_mib", 0, 100_000) * 1024**2
         rates = {}
         for process in payload.get("processes", []):
@@ -322,7 +322,7 @@ class AlertEngine:
         for name in set(self.app_samples) | set(rates):
             self.app_samples[name] = self.app_samples.get(name, 0) + 1 if threshold and rates.get(name, 0) >= threshold else 0
             if self.app_samples[name] >= 3:
-                events.append(("rate", name, f"Débit TCP inhabituel pour « {name} » sur trois relevés successifs.", cooldown))
+                events.append(("rate", name, f"Unusual TCP speed for « {name} » over three consecutive samples.", cooldown))
             if not self.app_samples[name]:
                 self.app_samples.pop(name, None)
         return events
@@ -363,7 +363,7 @@ class FeatureService:
             self.jobs.put_nowait((payload, rx, tx, applications, dict(config), context))
         except queue.Full:
             with self.lock:
-                self.error = "L'historique n'a pas pu enregistrer certains relevés : file saturée."
+                self.error = "Some history samples could not be saved: storage queue full."
         interval = bounded_number(config, "diagnostic_interval", 30, 600)
         with self.lock:
             if not enabled:
@@ -402,7 +402,7 @@ class FeatureService:
                 active = bool(payload["proxy_active"])
                 if self._connection_state is not None and active != self._connection_state:
                     self.store.add_event("tunnel", str(active),
-                                         "Tunnel devenu actif." if active else "Tunnel devenu inactif.",
+                                         "Tunnel became active." if active else "Tunnel became inactive.",
                                          payload["timestamp"])
                 self._connection_state = active
                 with self.lock:
@@ -425,7 +425,7 @@ class FeatureService:
                     self.events = events
             except Exception as exc:
                 with self.lock:
-                    self.error = "Historique indisponible : " + type(exc).__name__
+                    self.error = "History unavailable: " + type(exc).__name__
             finally:
                 self.jobs.task_done()
 
@@ -449,27 +449,27 @@ class ProfileStore:
     @staticmethod
     def validate(profile):
         if not isinstance(profile, dict):
-            raise ValueError("Le profil doit être un objet JSON.")
+            raise ValueError("The profile must be a JSON object.")
         if not isinstance(profile.get("name"), str) or not isinstance(profile.get("proxy_url"), str):
-            raise ValueError("Le nom et l'URL du profil doivent être du texte.")
+            raise ValueError("The profile name and URL must be strings.")
         name = profile["name"].strip()
         if not name or len(name) > 80 or any(ord(c) < 32 for c in name):
-            raise ValueError("Le nom du profil doit contenir 1 à 80 caractères.")
+            raise ValueError("The profile name must contain 1 to 80 characters.")
         proxy = validate_proxy(profile.get("proxy_url", "").strip())
         mode = profile.get("split_mode", "disabled")
         if mode not in ("disabled", "include", "exclude"):
-            raise ValueError("Mode de split tunneling invalide.")
+            raise ValueError("Invalid split tunneling mode.")
         apps = profile.get("split_apps", [])
         if not isinstance(apps, list) or len(apps) > 2000:
-            raise ValueError("Liste d'applications invalide.")
+            raise ValueError("Invalid application list.")
         normalized = []
         for app in apps:
             if not isinstance(app, str) or not app.strip() or len(app) > 256 or any(ord(c) < 32 for c in app):
-                raise ValueError("Nom d'application invalide.")
+                raise ValueError("Invalid application name.")
             normalized.append(app.strip().lower())
         bypass = profile.get("bypass_ftp", True)
         if type(bypass) is not bool:
-            raise ValueError("L'exemption FTP doit être un booléen.")
+            raise ValueError("FTP bypass must be a boolean.")
         return {"name": name, "proxy_url": proxy, "split_mode": mode,
                 "split_apps": sorted(set(normalized)), "bypass_ftp": bypass}
 
@@ -479,7 +479,7 @@ class ProfileStore:
         except FileNotFoundError:
             return []
         if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("profiles"), list):
-            raise ValueError("Le fichier de profils est invalide.")
+            raise ValueError("Invalid profiles file.")
         result = []
         ids = set()
         for profile in data["profiles"]:
@@ -487,7 +487,7 @@ class ProfileStore:
             valid["id"] = profile.get("id")
             if (not isinstance(valid["id"], str) or not valid["id"] or len(valid["id"]) > 64
                     or valid["id"] in ids):
-                raise ValueError("Identifiant de profil invalide.")
+                raise ValueError("Invalid profile identifier.")
             ids.add(valid["id"])
             result.append(valid)
         return result
@@ -497,9 +497,9 @@ class ProfileStore:
         with self.locked():
             profiles = self.list()
             if any(p["name"].casefold() == valid["name"].casefold() and p["id"] != profile_id for p in profiles):
-                raise ValueError("Un profil porte déjà ce nom.")
+                raise ValueError("A profile with this name already exists.")
             if profile_id is not None and not any(p["id"] == profile_id for p in profiles):
-                raise ValueError("Ce profil n'existe plus.")
+                raise ValueError("This profile no longer exists.")
             valid["id"] = profile_id or uuid.uuid4().hex
             profiles = [p for p in profiles if p["id"] != valid["id"]] + [valid]
             atomic_file(self.path, json.dumps({"version": 1, "profiles": profiles}, ensure_ascii=False, indent=2).encode())
@@ -529,7 +529,7 @@ def activate_profile(profile, config_path, split_path, execute, current_proxy=""
     previous = {p: (p.read_bytes() if p.exists() else None) for p in (config_path, split_path)}
     config = json.loads(previous[config_path]) if previous[config_path] is not None else {}
     if not isinstance(config, dict):
-        raise ValueError("Configuration JSON invalide.")
+        raise ValueError("Invalid JSON configuration.")
     config.update(split_tunnel_mode=profile["split_mode"], bypass_ftp=profile["bypass_ftp"])
     try:
         atomic_file(config_path, json.dumps(config, indent=2).encode())

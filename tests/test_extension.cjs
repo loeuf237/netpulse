@@ -42,9 +42,9 @@ function fixture(data) {
 }
 
 test('preferences hide upload and session totals', () => {
-    const {subject, state} = fixture({rx_speed_formatted: '1 Ko/s', tx_speed_formatted: '2 Ko/s', show_upload: false, show_session_total: false});
+    const {subject, state} = fixture({rx_speed_formatted: '1 KiB/s', tx_speed_formatted: '2 KiB/s', show_upload: false, show_session_total: false});
     subject._update(); state.complete();
-    assert.equal(subject._speedLabel.text, '↓ 1 Ko/s');
+    assert.equal(subject._speedLabel.text, '↓ 1 KiB/s');
     assert.equal(subject._sessionSection.actor.visible, false);
 });
 
@@ -59,7 +59,7 @@ test('overlapping reads are suppressed', () => {
 });
 
 test('destroy cancels outstanding reads and prevents later widget mutation', () => {
-    const {subject, state} = fixture({rx_speed_formatted: '100 Mo/s'});
+    const {subject, state} = fixture({rx_speed_formatted: '100 MiB/s'});
     subject._timerId = 42;
     subject._update(); subject.destroy(); state.complete();
     assert.equal(state.cancelled, true);

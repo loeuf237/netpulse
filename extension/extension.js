@@ -43,7 +43,7 @@ class NetSpeedButton extends PanelMenu.Button {
         box.add_child(this._icon);
 
         this._speedLabel = new St.Label({
-            text: '↓ 0 o/s  ↑ 0 o/s',
+            text: '↓ 0 B/s  ↑ 0 B/s',
             y_align: Clutter.ActorAlign.CENTER,
             style: 'font-family: monospace; font-size: 11px; margin-left: 5px; font-weight: bold;',
         });
@@ -56,8 +56,8 @@ class NetSpeedButton extends PanelMenu.Button {
         // -------------------------------------------------------------
         // 1. Live Speeds
         const liveSection = new PopupMenu.PopupMenuSection();
-        this._downSpeedItem = new PopupMenu.PopupMenuItem(_('📥 Réception : 0 o/s'), {reactive: false});
-        this._upSpeedItem = new PopupMenu.PopupMenuItem(_('📤 Envoi : 0 o/s'), {reactive: false});
+        this._downSpeedItem = new PopupMenu.PopupMenuItem(_('📥 Download: 0 B/s'), {reactive: false});
+        this._upSpeedItem = new PopupMenu.PopupMenuItem(_('📤 Upload: 0 B/s'), {reactive: false});
         liveSection.addMenuItem(this._downSpeedItem);
         liveSection.addMenuItem(this._upSpeedItem);
         this.menu.addMenuItem(liveSection);
@@ -67,13 +67,13 @@ class NetSpeedButton extends PanelMenu.Button {
         // 2. Session Totals
         const sessionSection = new PopupMenu.PopupMenuSection();
         this._sessionSection = sessionSection;
-        this._sessionHeader = new PopupMenu.PopupMenuItem(_('📊 Données échangées (Session) :'), {reactive: false});
+        this._sessionHeader = new PopupMenu.PopupMenuItem(_('📊 Data transferred (session):'), {reactive: false});
         this._sessionHeader.label.style = 'font-weight: bold; color: #8b949e;';
         sessionSection.addMenuItem(this._sessionHeader);
 
-        this._sessionRxItem = new PopupMenu.PopupMenuItem(_('Total reçu : 0 o'), {reactive: false});
-        this._sessionTxItem = new PopupMenu.PopupMenuItem(_('Total envoyé : 0 o'), {reactive: false});
-        this._sessionDurationItem = new PopupMenu.PopupMenuItem(_('Durée : 00:00'), {reactive: false});
+        this._sessionRxItem = new PopupMenu.PopupMenuItem(_('Total received: 0 B'), {reactive: false});
+        this._sessionTxItem = new PopupMenu.PopupMenuItem(_('Total sent: 0 B'), {reactive: false});
+        this._sessionDurationItem = new PopupMenu.PopupMenuItem(_('Duration: 00:00'), {reactive: false});
         sessionSection.addMenuItem(this._sessionRxItem);
         sessionSection.addMenuItem(this._sessionTxItem);
         sessionSection.addMenuItem(this._sessionDurationItem);
@@ -82,22 +82,22 @@ class NetSpeedButton extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // 3. Proxy & TUN Control
-        this._protectionItem = new PopupMenu.PopupMenuItem(_('🔒 Connexion protégée : confirmer dans NetPulse'), {reactive: false});
+        this._protectionItem = new PopupMenu.PopupMenuItem(_('🔒 Connection protected: confirm in NetPulse'), {reactive: false});
         this.menu.addMenuItem(this._protectionItem);
-        this._proxySwitch = new PopupMenu.PopupSwitchMenuItem(_('⚡ Forcer le Proxy (Mode TUN)'), false);
+        this._proxySwitch = new PopupMenu.PopupSwitchMenuItem(_('⚡ Route through proxy (TUN mode)'), false);
         this._proxySwitch.connect('toggled', (_item, state) => this._onProxyToggled(state));
         this.menu.addMenuItem(this._proxySwitch);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // 4. Quick Actions
-        const openAppItem = new PopupMenu.PopupMenuItem(_('🖥️ Ouvrir NetPulse...'));
+        const openAppItem = new PopupMenu.PopupMenuItem(_('🖥️ Open NetPulse...'));
         openAppItem.connect('activate', () => {
             this._spawn([this._guiBin]);
         });
         this.menu.addMenuItem(openAppItem);
 
-        const resetItem = new PopupMenu.PopupMenuItem(_('🔄 Réinitialiser les compteurs'));
+        const resetItem = new PopupMenu.PopupMenuItem(_('🔄 Reset counters'));
         resetItem.connect('activate', () => {
             this._spawn([this._monBin, '--reset']);
         });
@@ -106,7 +106,7 @@ class NetSpeedButton extends PanelMenu.Button {
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // 5. Quit Action
-        const quitItem = new PopupMenu.PopupMenuItem(_('🛑 Quitter NetPulse'));
+        const quitItem = new PopupMenu.PopupMenuItem(_('🛑 Quit NetPulse'));
         quitItem.connect('activate', () => {
             this._requestNetworkAction('quit');
         });
@@ -124,7 +124,7 @@ class NetSpeedButton extends PanelMenu.Button {
         if (this._destroyed)
             return false;
         if (this._connectionProtected) {
-            Main.notify(_('Connexion protégée'), _('Pour modifier ou arrêter le tunnel, ouvrez NetPulse et confirmez le changement.'));
+            Main.notify(_('Connection protected'), _('To change or stop the tunnel, open NetPulse and confirm the change.'));
             this._spawn([this._guiBin]);
             return false;
         }
@@ -184,8 +184,8 @@ class NetSpeedButton extends PanelMenu.Button {
                     this._connectionProtected = data.connection_protected !== false || data.network_actions_deferred === true;
                     this._protectionItem.actor.visible = this._connectionProtected;
 
-                    const rx = data.rx_speed_formatted || '0 o/s';
-                    const tx = data.tx_speed_formatted || '0 o/s';
+                    const rx = data.rx_speed_formatted || '0 B/s';
+                    const tx = data.tx_speed_formatted || '0 B/s';
                     const speeds = [];
                     if (data.show_download !== false)
                         speeds.push(`↓ ${rx}`);
@@ -194,16 +194,16 @@ class NetSpeedButton extends PanelMenu.Button {
                     this._speedLabel.text = speeds.join('  ');
                     this._sessionSection.actor.visible = data.show_session_total !== false;
 
-                    this._downSpeedItem.label.text = `📥 Réception : ${rx}`;
-                    this._upSpeedItem.label.text = `📤 Envoi : ${tx}`;
+                    this._downSpeedItem.label.text = `📥 Download: ${rx}`;
+                    this._upSpeedItem.label.text = `📤 Upload: ${tx}`;
 
-                    const totRx = data.session_rx_formatted || '0 o';
-                    const totTx = data.session_tx_formatted || '0 o';
-                    this._sessionRxItem.label.text = `Total reçu : ${totRx}`;
-                    this._sessionTxItem.label.text = `Total envoyé : ${totTx}`;
+                    const totRx = data.session_rx_formatted || '0 B';
+                    const totTx = data.session_tx_formatted || '0 B';
+                    this._sessionRxItem.label.text = `Total received: ${totRx}`;
+                    this._sessionTxItem.label.text = `Total sent: ${totTx}`;
 
                     const dur = this._formatDuration(data.session_duration_sec || 0);
-                    this._sessionDurationItem.label.text = `Durée de session : ${dur}`;
+                    this._sessionDurationItem.label.text = `Session duration: ${dur}`;
 
                     if ('proxy_active' in data) {
                         const isActive = !!data.proxy_active;

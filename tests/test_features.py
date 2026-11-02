@@ -70,7 +70,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.store.export_csv(destination), 2)
         with destination.open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
-        self.assertEqual({r["portee"] for r in rows}, {"Global TCP+UDP", "TCP echantillonne"})
+        self.assertEqual({r["scope"] for r in rows}, {"Global TCP+UDP", "Sampled TCP"})
         self.assertIn("'=danger", [r["application"] for r in rows])
 
 

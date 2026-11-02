@@ -59,8 +59,8 @@ class GuiTests(unittest.TestCase):
         self.assertIn('673.2,', svg)
 
     def test_search_accepts_partial_pid_and_rejects_query_containing_pid(self):
-        process = {'pid': 12345, 'name': 'browser', 'status': 'Connected', 'total_rx_formatted': '0 o',
-                   'total_tx_formatted': '0 o', 'rx_speed_formatted': '0 o/s', 'tx_speed_formatted': '0 o/s',
+        process = {'pid': 12345, 'name': 'browser', 'status': 'Connected', 'total_rx_formatted': '0 B',
+                   'total_tx_formatted': '0 B', 'rx_speed_formatted': '0 B/s', 'tx_speed_formatted': '0 B/s',
                    'rx_speed': 0, 'tx_speed': 0}
         fake = SimpleNamespace(filter_blocked_only=False, search_filter='123', current_processes=[process],
                                row_widgets={12345: {'row': Mock(), 'down_lbl': Mock(), 'up_lbl': Mock(),
@@ -78,8 +78,8 @@ class GuiTests(unittest.TestCase):
         old = [{'remote_host': '198.51.100.1'}]
         new = [{'remote_host': 'server.example'}]
         process = {'pid': 42, 'name': 'browser', 'status': 'Connected', 'connections': new,
-                   'total_rx_formatted': '0 o', 'total_tx_formatted': '0 o', 'rx_speed_formatted': '0 o/s',
-                   'tx_speed_formatted': '0 o/s', 'rx_speed': 0, 'tx_speed': 0}
+                   'total_rx_formatted': '0 B', 'total_tx_formatted': '0 B', 'rx_speed_formatted': '0 B/s',
+                   'tx_speed_formatted': '0 B/s', 'rx_speed': 0, 'tx_speed': 0}
         fake = SimpleNamespace(filter_blocked_only=False, search_filter='', current_processes=[process],
                                row_widgets={42: {'row': Mock(), 'down_lbl': Mock(), 'up_lbl': Mock(),
                                                   'btn_block': Mock(), 'connections': old, 'sub_rows': [Mock()]}},

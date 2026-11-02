@@ -6,7 +6,7 @@
 set -e
 
 if [ "$(id -u)" -eq 0 ]; then
-    echo "Lancez ./install.sh avec votre utilisateur de session ; sudo est appelé lorsque nécessaire." >&2
+    echo "Run ./install.sh as your desktop user; sudo is used when needed." >&2
     exit 1
 fi
 
@@ -21,12 +21,12 @@ SYSTEMD_USER_DIR="$HOME_DIR/.config/systemd/user"
 EXT_DIR="$HOME_DIR/.local/share/gnome-shell/extensions/force-proxy@paulin"
 
 echo "=========================================================="
-echo "    Installation de NetPulse — Moniteur Réseau & Pare-feu "
+echo "    NetPulse Installation — Network Monitor & Firewall "
 echo "=========================================================="
 echo
 
 # 1. Vérification des dépendances système
-echo "[1/7] Vérification et installation des paquets requis..."
+echo "[1/7] Checking and installing required packages..."
 MISSING_PKGS=()
 for pkg in python3-gi python3-cairo python3-gi-cairo gir1.2-rsvg-2.0 python3-psutil gir1.2-adw-1 gir1.2-gtk-4.0 gir1.2-dbusmenu-glib-0.4 gsettings-desktop-schemas iptables iproute2; do
     if ! dpkg -s "$pkg" >/dev/null 2>&1; then
@@ -35,15 +35,15 @@ for pkg in python3-gi python3-cairo python3-gi-cairo gir1.2-rsvg-2.0 python3-psu
 done
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
-    echo "Installation des dépendances manquantes : ${MISSING_PKGS[*]}..."
+    echo "Installing missing dependencies: ${MISSING_PKGS[*]}..."
     sudo apt-get update -qq
     sudo apt-get install -y -qq "${MISSING_PKGS[@]}"
 else
-    echo "Toutes les dépendances requises sont déjà installées."
+    echo "All required dependencies are already installed."
 fi
 
 # 2. Installation des exécutables
-echo "[2/7] Installation des exécutables dans $BIN_DIR..."
+echo "[2/7] Installing executables in $BIN_DIR..."
 mkdir -p "$BIN_DIR"
 
 install -m 755 "$SCRIPT_DIR/bin/netpulse-gui" "$BIN_DIR/netpulse-gui"
@@ -65,7 +65,7 @@ ln -sf "$BIN_DIR/netpulse-monitor" "$BIN_DIR/force-proxy-monitor"
 ln -sf "$BIN_DIR/netpulse-ctl" "$BIN_DIR/force-proxy-ctl"
 
 # 3. Installation des icônes (Vectoriel SVG + PNG multi-résolutions)
-echo "[3/7] Installation des icônes NetPulse..."
+echo "[3/7] Installing NetPulse icons..."
 mkdir -p "$ICON_DIR/scalable/apps"
 cp "$SCRIPT_DIR/icons/netpulse.svg" "$ICON_DIR/scalable/apps/netpulse.svg"
 
@@ -88,7 +88,7 @@ PYICONS
 gtk-update-icon-cache -f -t "$ICON_DIR" 2>/dev/null || true
 
 # 4. Installation du lanceur d'application (.desktop)
-echo "[4/7] Enregistrement du lanceur de bureau..."
+echo "[4/7] Registering the desktop launcher..."
 mkdir -p "$APP_DIR"
 cp "$SCRIPT_DIR/desktop/netpulse.desktop" "$APP_DIR/netpulse.desktop"
 python3 - "$APP_DIR/netpulse.desktop" "$BIN_DIR/netpulse-gui" <<'PYDESKTOP'
@@ -101,14 +101,14 @@ PYDESKTOP
 update-desktop-database "$APP_DIR" 2>/dev/null || true
 
 # 5. Configuration des droits sans mot de passe (sudoers) pour le pare-feu et le TUN
-echo "[5/7] Configuration des privilèges réseau (Sudoers)..."
+echo "[5/7] Configuring network privileges (sudoers)..."
 sudo install -d -o root -g root -m 755 "$ROOT_BIN_DIR"
 sudo install -o root -g root -m 755 "$SCRIPT_DIR/bin/netpulse-ctl" "$ROOT_BIN_DIR/netpulse-ctl"
 sudo install -o root -g root -m 755 "$SCRIPT_DIR/bin/tun2socks" "$ROOT_BIN_DIR/tun2socks"
 sudo "$ROOT_BIN_DIR/netpulse-ctl" update-sudoers
 
 # 6. Installation de l'extension GNOME Shell (Indicateur barre supérieure)
-echo "[6/7] Installation de l'extension GNOME Shell..."
+echo "[6/7] Installing the GNOME Shell extension..."
 if [ -d "$SCRIPT_DIR/extension" ]; then
     mkdir -p "$EXT_DIR"
     cp -r "$SCRIPT_DIR/extension/"* "$EXT_DIR/"
@@ -116,7 +116,7 @@ if [ -d "$SCRIPT_DIR/extension" ]; then
 fi
 
 # 7. Activation du service d'arrière-plan (systemd user)
-echo "[7/7] Démarrage du service d'arrière-plan..."
+echo "[7/7] Starting the background service..."
 mkdir -p "$SYSTEMD_USER_DIR"
 systemctl --user stop force-proxy-monitor.service 2>/dev/null || true
 systemctl --user disable force-proxy-monitor.service 2>/dev/null || true
@@ -130,9 +130,9 @@ systemctl --user restart netpulse-monitor.service
 
 echo
 echo "=========================================================="
-echo "    Installation terminée avec succès !"
+echo "    Installation completed successfully!"
 echo "=========================================================="
-echo "Vous pouvez désormais :"
-echo "  • Lancer l'application graphique : tapez 'netpulse' ou ouvrez 'NetPulse' depuis vos applications."
-echo "  • Utiliser la ligne de commande : 'netpulse-ctl status', 'netpulse-ctl block-app <nom>'."
+echo "You can now:"
+echo "  • Launch the interface: run 'netpulse' or open 'NetPulse' from your applications."
+echo "  • Use the command line: 'netpulse-ctl status', 'netpulse-ctl block-app <name>'."
 echo "=========================================================="

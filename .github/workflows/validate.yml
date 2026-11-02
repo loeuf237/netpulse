@@ -1,7 +1,9 @@
-name: Validation NetPulse
+name: NetPulse CI/CD
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -9,46 +11,114 @@ permissions:
   contents: read
 
 concurrency:
-  group: validation-${{ github.ref }}
-  cancel-in-progress: true
+  group: netpulse-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  validate:
+  ubuntu:
+    name: Ubuntu ${{ matrix.ubuntu }} (${{ matrix.coverage }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ubuntu: '18.04'
+            coverage: core
+          - ubuntu: '22.04'
+            coverage: monitor
+          - ubuntu: '26.04'
+            coverage: full GTK
+    steps:
+      # Checkout runs on the host: Node-based actions cannot run in Bionic's glibc.
+      - uses: actions/checkout@v6
+      - name: Test in the requested Ubuntu userspace
+        run: |
+          mkdir -p "$RUNNER_TEMP/ubuntu-artifacts"
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -v "$RUNNER_TEMP/ubuntu-artifacts:/artifacts" \
+            ubuntu:${{ matrix.ubuntu }} bash tools/ci_ubuntu.sh '${{ matrix.ubuntu }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-${{ matrix.ubuntu }}-wheel
+          path: ${{ runner.temp }}/ubuntu-artifacts/**/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  javascript:
+    name: GNOME extension
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y python3-gi python3-cairo python3-gi-cairo python3-psutil python3-venv python3-pip gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-rsvg-2.0 gsettings-desktop-schemas xvfb
-          /usr/bin/python3 -m venv --system-site-packages .venv
-          .venv/bin/python -m pip install build
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
-      - name: Check generated executables
-        run: .venv/bin/python tools/build_executables.py --check
-      - name: Check syntax
-        run: |
-          bash -n install.sh uninstall.sh src/netpulse/ctl.sh bin/netpulse-ctl
-          .venv/bin/python -m compileall -q src tests tools live-upgrade.py
-          .venv/bin/python -m py_compile bin/netpulse-gui bin/netpulse-monitor
+      - run: |
           node --input-type=module --check < extension/extension.js
-          git diff --check
-      - name: Run regression tests
-        env:
-          GSETTINGS_BACKEND: memory
-        run: |
-          .venv/bin/python -m unittest discover -s tests -v
           node tests/test_extension.cjs
-      - name: Verify the GTK interface in an isolated display
+          git diff --check
+
+  package:
+    name: Release artifacts
+    needs: [ubuntu, javascript]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Validate version and build packages
         env:
-          GSETTINGS_BACKEND: memory
-          GSK_RENDERER: cairo
-          GTK_A11Y: none
-        run: xvfb-run -a .venv/bin/python tools/gui_smoke.py
-      - name: Build and verify the wheel
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          .venv/bin/python -m build --wheel
-          .venv/bin/python tools/check_wheel.py dist/*.whl
+          if [ -n "$RELEASE_TAG" ]; then
+            python tools/release.py --tag "$RELEASE_TAG"
+          else
+            python tools/release.py
+          fi
+          python -m pip install build
+          python -m build
+          python tools/check_wheel.py dist/*.whl
+          python tools/release.py --dist dist
+          cd dist
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netpulse-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: package
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: netpulse-release
+          path: dist
+      - name: Publish tested artifacts and curated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 tools/release.py --tag "$RELEASE_TAG"
+          cd dist
+          sha256sum -c SHA256SUMS
+          cd ..
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --draft \
+              --title "NetPulse ${RELEASE_TAG#v}" --notes-file "releases/$RELEASE_TAG.md"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest \
+            --title "NetPulse ${RELEASE_TAG#v}" --notes-file "releases/$RELEASE_TAG.md"

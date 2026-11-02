@@ -1,12 +1,12 @@
 [Desktop Entry]
 Name=NetPulse
-GenericName=Moniteur Réseau & Pare-feu
-Comment=Surveillance du trafic par application (style GlassWire), pare-feu et forçage proxy TUN
+GenericName=Network Monitor & Firewall
+Comment=Per-application traffic monitoring, application firewall and TUN proxy routing
 Exec=netpulse-gui
 Icon=netpulse
 Terminal=false
 Type=Application
 Categories=Network;Monitor;
-Keywords=Network;Proxy;GlassWire;Speed;Traffic;Monitor;TUN;NetPulse;Pare-feu;
+Keywords=Network;Proxy;GlassWire;Speed;Traffic;Monitor;TUN;NetPulse;Firewall;
 StartupNotify=true
 StartupWMClass=org.antigravity.NetPulse

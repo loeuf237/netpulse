@@ -189,13 +189,13 @@ def format_bytes(b, unit_mode="auto"):
             return f"{bits / 1_000_000_000:.2f} Gbps"
     else:
         if b < 1024:
-            return f"{b:.0f} o"
+            return f"{b:.0f} B"
         elif b < 1024 * 1024:
-            return f"{b / 1024:.1f} Ko"
+            return f"{b / 1024:.1f} KiB"
         elif b < 1024 * 1024 * 1024:
-            return f"{b / (1024 * 1024):.1f} Mo"
+            return f"{b / (1024 * 1024):.1f} MiB"
         else:
-            return f"{b / (1024 * 1024 * 1024):.2f} Go"
+            return f"{b / (1024 * 1024 * 1024):.2f} GiB"
 
 
 def format_speed(bps, unit_mode="auto"):
@@ -354,10 +354,10 @@ class NetPulseEngine:
         if resume_session:
             self._restore_session()
 
-        self.cur_rx_formatted = "0 o/s"
-        self.cur_tx_formatted = "0 o/s"
-        self.cur_tot_rx_formatted = "0 o"
-        self.cur_tot_tx_formatted = "0 o"
+        self.cur_rx_formatted = "0 B/s"
+        self.cur_tx_formatted = "0 B/s"
+        self.cur_tot_rx_formatted = "0 B"
+        self.cur_tot_tx_formatted = "0 B"
         self.cur_duration_str = "00m 00s"
 
         # Initialize firewall rules
@@ -384,7 +384,7 @@ class NetPulseEngine:
         bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                       "org.freedesktop.Notifications", "Notify",
                       GLib.Variant("(susssasa{sv}i)", ("NetPulse", 0, "netpulse",
-                                    "Alerte NetPulse", event["message"], [], {}, 8000)),
+                                    "NetPulse alert", event["message"], [], {}, 8000)),
                       None, Gio.DBusCallFlags.NONE, 1500, None)
 
     def _refresh_protection(self):
@@ -545,10 +545,10 @@ class NetPulseEngine:
                 return GLib.Variant("s", "")
             elif prop == "ToolTip":
                 tooltip_body = (
-                    f"📥 Réception : {self.cur_rx_formatted}\n"
-                    f"📤 Envoi : {self.cur_tx_formatted}\n"
+                    f"📥 Download: {self.cur_rx_formatted}\n"
+                    f"📤 Upload: {self.cur_tx_formatted}\n"
                     f"📊 Session : ↓ {self.cur_tot_rx_formatted} | ↑ {self.cur_tot_tx_formatted}\n"
-                    f"⏱️ Durée : {self.cur_duration_str}"
+                    f"⏱️ Duration: {self.cur_duration_str}"
                 )
                 return GLib.Variant("(sa(iiay)ss)", ("netpulse", [], "NetPulse", tooltip_body))
             return None
@@ -575,12 +575,12 @@ class NetPulseEngine:
         self.menu_root = self.Dbusmenu.Menuitem.new()
 
         self.mi_down = self.Dbusmenu.Menuitem.new()
-        self.mi_down.property_set("label", "📥 Réception : 0 o/s")
+        self.mi_down.property_set("label", "📥 Download: 0 B/s")
         self.mi_down.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_down)
 
         self.mi_up = self.Dbusmenu.Menuitem.new()
-        self.mi_up.property_set("label", "📤 Envoi : 0 o/s")
+        self.mi_up.property_set("label", "📤 Upload: 0 B/s")
         self.mi_up.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_up)
 
@@ -589,17 +589,17 @@ class NetPulseEngine:
         self.menu_root.child_append(sep1)
 
         self.mi_tot_rx = self.Dbusmenu.Menuitem.new()
-        self.mi_tot_rx.property_set("label", "Total reçu : 0 o")
+        self.mi_tot_rx.property_set("label", "Total received: 0 B")
         self.mi_tot_rx.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_tot_rx)
 
         self.mi_tot_tx = self.Dbusmenu.Menuitem.new()
-        self.mi_tot_tx.property_set("label", "Total envoyé : 0 o")
+        self.mi_tot_tx.property_set("label", "Total sent: 0 B")
         self.mi_tot_tx.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_tot_tx)
 
         self.mi_dur = self.Dbusmenu.Menuitem.new()
-        self.mi_dur.property_set("label", "Durée : 00:00")
+        self.mi_dur.property_set("label", "Duration: 00:00")
         self.mi_dur.property_set_bool("enabled", False)
         self.menu_root.child_append(self.mi_dur)
 
@@ -608,7 +608,7 @@ class NetPulseEngine:
         self.menu_root.child_append(sep2)
 
         self.mi_proxy = self.Dbusmenu.Menuitem.new()
-        self.mi_proxy.property_set("label", "⚡ Forcer le Proxy (Mode TUN) : Inactif")
+        self.mi_proxy.property_set("label", "⚡ Route through proxy (TUN mode): Inactive")
         self.mi_proxy.connect("item-activated", lambda mi, ts: self.toggle_proxy())
         self.menu_root.child_append(self.mi_proxy)
 
@@ -617,12 +617,12 @@ class NetPulseEngine:
         self.menu_root.child_append(sep3)
 
         mi_open = self.Dbusmenu.Menuitem.new()
-        mi_open.property_set("label", "🖥️ Ouvrir NetPulse...")
+        mi_open.property_set("label", "🖥️ Open NetPulse...")
         mi_open.connect("item-activated", lambda mi, ts: self.open_gui())
         self.menu_root.child_append(mi_open)
 
         mi_reset = self.Dbusmenu.Menuitem.new()
-        mi_reset.property_set("label", "🔄 Réinitialiser les données de session")
+        mi_reset.property_set("label", "🔄 Reset session data")
         mi_reset.connect("item-activated", lambda mi, ts: self.reset_session())
         self.menu_root.child_append(mi_reset)
 
@@ -631,7 +631,7 @@ class NetPulseEngine:
         self.menu_root.child_append(sep4)
 
         mi_quit = self.Dbusmenu.Menuitem.new()
-        mi_quit.property_set("label", "🛑 Quitter NetPulse")
+        mi_quit.property_set("label", "🛑 Quit NetPulse")
         mi_quit.connect("item-activated", lambda mi, ts: self.quit())
         self.menu_root.child_append(mi_quit)
 
@@ -679,11 +679,11 @@ class NetPulseEngine:
                 proxy_name = proxy_display(data.get("proxy", ""))
                 if self.enable_tray and hasattr(self, "mi_proxy"):
                     if self.config.get("connection_protected", True) or getattr(self, "_protected_tunnel", None):
-                        self.mi_proxy.property_set("label", "🔒 Connexion protégée : confirmer dans NetPulse")
+                        self.mi_proxy.property_set("label", "🔒 Connection protected: confirm in NetPulse")
                     elif self.proxy_active:
-                        self.mi_proxy.property_set("label", f"⚡ Forcer le Proxy : ACTIF ({proxy_name})")
+                        self.mi_proxy.property_set("label", f"⚡ Proxy routing: ACTIVE ({proxy_name})")
                     else:
-                        self.mi_proxy.property_set("label", "⚡ Forcer le Proxy (Mode TUN) : Inactif")
+                        self.mi_proxy.property_set("label", "⚡ Route through proxy (TUN mode): Inactive")
 
                     if was_active != self.proxy_active:
                         self.bus.emit_signal(
@@ -936,15 +936,15 @@ class NetPulseEngine:
 
                 statuses = set(c.status for c in c_list if c.status)
                 if is_app_blocked:
-                    status_text = "🚫 Bloqué (Pare-feu)"
+                    status_text = "🚫 Blocked (Firewall)"
                 elif "ESTABLISHED" in statuses:
-                    status_text = f"Connecté ({len(c_list)})"
+                    status_text = f"Connected ({len(c_list)})"
                 elif "LISTEN" in statuses:
-                    status_text = "En écoute"
+                    status_text = "Listening"
                 elif statuses:
                     status_text = f"{list(statuses)[0]} ({len(c_list)})"
                 else:
-                    status_text = f"Actif ({len(c_list)})"
+                    status_text = f"Active ({len(c_list)})"
 
                 conn_details = []
                 contacted_hosts = set()
@@ -1048,11 +1048,11 @@ class NetPulseEngine:
 
         if self.enable_tray:
             try:
-                self.mi_down.property_set("label", f"📥 Réception : {self.cur_rx_formatted}")
-                self.mi_up.property_set("label", f"📤 Envoi : {self.cur_tx_formatted}")
-                self.mi_tot_rx.property_set("label", f"Total reçu : {self.cur_tot_rx_formatted}")
-                self.mi_tot_tx.property_set("label", f"Total envoyé : {self.cur_tot_tx_formatted}")
-                self.mi_dur.property_set("label", f"Durée de session : {self.cur_duration_str}")
+                self.mi_down.property_set("label", f"📥 Download: {self.cur_rx_formatted}")
+                self.mi_up.property_set("label", f"📤 Upload: {self.cur_tx_formatted}")
+                self.mi_tot_rx.property_set("label", f"Total received: {self.cur_tot_rx_formatted}")
+                self.mi_tot_tx.property_set("label", f"Total sent: {self.cur_tot_tx_formatted}")
+                self.mi_dur.property_set("label", f"Session duration: {self.cur_duration_str}")
 
                 self.bus.emit_signal(
                     None,
@@ -1102,7 +1102,7 @@ def main():
     if "--reset" in sys.argv:
         with open(RESET_FLAG_PATH, "w") as f:
             f.write("1")
-        print("Demande de réinitialisation envoyée au moniteur.")
+        print("Reset request sent to the monitor.")
         sys.exit(0)
 
     enable_tray = "--tray" in sys.argv

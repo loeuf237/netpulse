@@ -1,0 +1,10 @@
+include LICENSE THIRD_PARTY_NOTICES.md README.md CHANGELOG.md FEATURES.md AUDIT.md
+include install.sh uninstall.sh live-upgrade.py
+recursive-include releases *.md
+recursive-include tools *.py *.sh
+recursive-include tests *.py *.cjs
+recursive-include bin netpulse-* tun2socks
+recursive-include desktop *.desktop
+recursive-include extension *.js *.json *.css
+recursive-include icons *.svg
+recursive-include systemd *.service

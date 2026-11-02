@@ -36,9 +36,9 @@ with tempfile.TemporaryDirectory() as temporary:
         window.present()
         payload = {"proxy_active": True, "connection_protected": True, "network_actions_deferred": True,
                    "diagnostics": {"timestamp": time.time(), "server": {"state": "ok", "detail": "socks5://127.0.0.1:1080"},
-                                   "tunnel": {"state": "ok", "detail": "Tunnel actif"},
+                                   "tunnel": {"state": "ok", "detail": "Tunnel active"},
                                    "dns": {"state": "ok", "detail": "Hôte résolu"},
-                                   "internet": {"state": "ok", "detail": "HTTPS : HTTP 200", "latency_ms": 85.2}},
+                                   "internet": {"state": "ok", "detail": "HTTPS: HTTP 200", "latency_ms": 85.2}},
                    "alerts": [{"id": 1, "timestamp": time.time(), "message": "Exemple d'événement enregistré", "kind": "quota"}]}
         window.latest_stats = payload
         window._apply_tun_status({"active": True, "proxy": "socks5://127.0.0.1:1080"})
@@ -59,13 +59,13 @@ with tempfile.TemporaryDirectory() as temporary:
         window.history_period.set_selected(1)
         window.current_processes = [
             {"pid": index + 100, "name": name, "status": "Connecté", "routing": "proxy",
-             "total_rx_formatted": "10 Mo", "total_tx_formatted": "1 Mo",
-             "rx_speed_formatted": "1 Mo/s", "tx_speed_formatted": "0 o/s",
+             "total_rx_formatted": "10 MiB", "total_tx_formatted": "1 MiB",
+             "rx_speed_formatted": "1 MiB/s", "tx_speed_formatted": "0 B/s",
              "rx_speed": 1048576, "tx_speed": 0, "is_blocked": False,
              "rule_status": {"state": state, "label": label, "detail": "Affectation observée"}}
             for index, (name, state, label) in enumerate(
-                (("browser", "applied", "Appliquée"), ("chat", "pending", "En attente"),
-                 ("download", "error", "En erreur")))]
+                (("browser", "applied", "Applied"), ("chat", "pending", "Pending"),
+                 ("download", "error", "Error")))]
         window._render_process_list()
         assert len(window.row_widgets) == 3
         for page in ("applications", "proxy", "diagnostic", "history", "settings"):
@@ -77,6 +77,6 @@ with tempfile.TemporaryDirectory() as temporary:
                 while context.pending():
                     context.iteration(False)
                 time.sleep(0.01)
-        assert "10.0 Mo" in window.history_totals_row.get_subtitle()
+        assert "10.0 MiB" in window.history_totals_row.get_subtitle()
         window.close()
 print("GTK interface verified: 5 tabs, protection, profile editor and history.")

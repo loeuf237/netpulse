@@ -1,6 +1,6 @@
 {
   "name": "NetPulse",
-  "description": "Indicateur de débit réseau en temps réel dans la barre supérieure, totaux de session et contrôle du proxy TUN (Style Internet Speed Meter & GlassWire)",
+  "description": "Live network speeds, session totals and protected TUN proxy controls in the GNOME top bar",
   "uuid": "force-proxy@paulin",
   "shell-version": [
     "46",
@@ -9,5 +9,5 @@
     "49",
     "50"
   ],
-  "version": 3
+  "version": 4
 }

@@ -58,46 +58,46 @@ fi
 
 show_help() {
     cat << EOF
-NetPulse CLI - Contrôleur Réseau, Forçage Proxy TUN & Pare-feu Applicatif
+NetPulse CLI - Network Monitor, TUN Proxy Routing & Application Firewall
 
-Utilisation :
-  $CMD_NAME <commande> [options]
+Usage:
+  $CMD_NAME <command> [options]
 
-Gestion du Forçage Proxy (Mode TUN) :
-  status [--json]          Afficher l'état du routage TUN et du proxy configuré
-  start [proxy_url]        Activer le forçage TUN global (ex: socks5://127.0.0.1:1080)
-  stop                     Désactiver le forçage TUN et rétablir la connexion normale
-  toggle [proxy_url]       Basculer l'état du forçage TUN (démarrer / arrêter)
+TUN proxy routing:
+  status [--json]          Show TUN routing status and the configured proxy
+  start [proxy_url]        Start global TUN routing (e.g. socks5://127.0.0.1:1080)
+  stop                     Stop TUN routing and restore normal routing
+  toggle [proxy_url]       Toggle TUN routing (start / stop)
 
-Routage Sélectif (Split Tunneling) :
-  split-status [--json]    Afficher l'état du split tunneling et les applications actives
-  split-mode [mode]        Définir ou afficher le mode : disabled, include, exclude
-  split-add <nom>          Ajouter une application à la liste (ex: telegram, steam, chrome)
-  split-del <nom>          Retirer une application de la liste
-  split-list               Lister toutes les applications configurées
-  split-assign <pid> <dst> Assigner un PID vers un routage (proxy, direct, default)
-  split-sync               Synchroniser tous les processus actifs selon le mode
+Selective routing (split tunneling):
+  split-status [--json]    Show split tunneling status and active applications
+  split-mode [mode]        Set or show the mode: disabled, include, exclude
+  split-add <name>          Add an application to the list (e.g. telegram, steam, chrome)
+  split-del <name>          Remove an application from the list
+  split-list               List all configured applications
+  split-assign <pid> <dst> Assign a PID to a route (proxy, direct, default)
+  split-sync               Reconcile active processes with the configured mode
 
-Contournement FTP (Protection des transferts de fichiers) :
-  ftp-status               Afficher l'état du contournement FTP et des règles de routage
-  ftp-bypass [on|off]      Activer ou désactiver l'exemption automatique du trafic FTP (actif par défaut)
+FTP bypass (file transfer protection):
+  ftp-status               Show FTP bypass status and routing rules
+  ftp-bypass [on|off]      Enable or disable automatic FTP bypass (enabled by default)
 
-Pare-feu Applicatif (GlassWire Killswitch) :
-  block-app <nom>          Bloquer tout accès réseau pour une application (ex: steam, chrome)
-  unblock-app <nom>        Débloquer une application et rétablir son accès internet
-  block <pid>              Bloquer immédiatement les sockets et paquets d'un PID
-  unblock <pid>            Débloquer un PID
-  firewall-init            Initialiser les règles noyau cgroup v2 & iptables
-  firewall-reset           Réinitialiser et supprimer toutes les règles de filtrage
+Application firewall:
+  block-app <name>          Block network access for an application (e.g. steam, chrome)
+  unblock-app <name>        Unblock an application and restore network access
+  block <pid>              Block sockets and packets for a PID
+  unblock <pid>            Unblock a PID
+  firewall-init            Initialize kernel cgroup v2 and iptables rules
+  firewall-reset           Reset and remove all filtering rules
 
-Général :
-  gui, open                Ouvrir l'interface graphique NetPulse
-  reset-session            Réinitialiser les compteurs de session réseau (débits / volumes)
-  install-runtime          Installer le contrôleur privilégié et adopter le tunnel existant sans le relancer
-  quit, exit               Fermer complètement NetPulse (démon, interface et proxy)
-  help, -h, --help         Afficher cette aide
+General:
+  gui, open                Open the NetPulse interface
+  reset-session            Reset network session counters (speeds / totals)
+  install-runtime          Install the privileged controller and adopt the existing tunnel without restarting it
+  quit, exit               Close NetPulse completely (daemon, interface and proxy)
+  help, -h, --help         Show this help
 
-Exemples :
+Examples:
   $CMD_NAME status
   $CMD_NAME split-mode include
   $CMD_NAME split-add telegram
@@ -136,7 +136,7 @@ try:
     except FileNotFoundError:
         config = {}
     if not isinstance(config, dict):
-        raise ValueError("la configuration doit être un objet JSON")
+        raise ValueError("configuration must be a JSON object")
     config[key] = json.loads(value)
     fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path))
     try:
@@ -167,7 +167,7 @@ read_bypass_ftp() {
             return 0
         fi
     fi
-    echo "1" # Actif par défaut
+    echo "1" # Enabled par défaut
 }
 
 save_bypass_ftp() {
@@ -219,7 +219,7 @@ case "$1" in
         exit 0
         ;;
     quit|exit)
-        echo "Fermeture complète de NetPulse..."
+        echo "Closing NetPulse completely..."
         systemctl --user stop netpulse-monitor.service 2>/dev/null || true
         systemctl --user stop force-proxy-monitor.service 2>/dev/null || true
         pkill -f netpulse-gui 2>/dev/null || true
@@ -227,7 +227,7 @@ case "$1" in
         if get_status; then
             "$REAL_SCRIPT" stop 2>/dev/null || true
         fi
-        echo "NetPulse arrêté avec succès."
+        echo "NetPulse stopped successfully."
         exit 0
         ;;
     split-list)
@@ -260,26 +260,26 @@ case "$1" in
             exit 0
         fi
 
-        echo "--- État du Split Tunneling NetPulse ---"
+        echo "--- NetPulse Split Tunneling Status ---"
         echo "Mode actuel : $mode"
         case "$mode" in
             include)
-                echo "Comportement : Mode Inclusif (Seules les $app_count applications configurées transitent par le proxy TUN)"
+                echo "Behavior: Include mode (only the $app_count configured applications use the TUN proxy)"
                 ;;
             exclude)
-                echo "Comportement : Mode Exclusif (Tout le PC transite par le proxy SAUF les $app_count applications configurées)"
+                echo "Behavior: Exclude mode (all applications use the proxy EXCEPT the $app_count configured applications)"
                 ;;
             disabled|*)
-                echo "Comportement : Désactivé (Tout le trafic de l'ordinateur transite par le proxy TUN)"
+                echo "Behavior: Global mode (IPv4 traffic uses the TUN proxy with configured exemptions)"
                 ;;
         esac
-        echo "Processus routés vers Proxy (cgroup net_proxy) : $proxy_pids_count"
-        echo "Processus routés vers Direct (cgroup net_direct) : $direct_pids_count"
+        echo "Processes assigned to Proxy (cgroup net_proxy): $proxy_pids_count"
+        echo "Processes assigned to Direct (cgroup net_direct): $direct_pids_count"
         if [ -f "$SPLIT_FILE" ] && [ "$app_count" -gt 0 ]; then
-            echo "Applications enregistrées :"
+            echo "Configured applications:"
             sed 's/^/  - /' "$SPLIT_FILE"
         else
-            echo "Aucune application enregistrée."
+            echo "No applications configured."
         fi
         exit 0
         ;;
@@ -323,8 +323,8 @@ PYSTATUS
 if [ "$1" = "status" ]; then
     split_mode=$(read_split_mode)
     bypass_ftp=$(read_bypass_ftp)
-    ftp_desc="Désactivé"
-    [ "$bypass_ftp" = "1" ] && ftp_desc="Actif"
+    ftp_desc="Disabled"
+    [ "$bypass_ftp" = "1" ] && ftp_desc="Enabled"
     if [ "$2" = "--json" ]; then
         if get_status; then
             curr_proxy=$(cat "$STATE_FILE" 2>/dev/null || read_gnome_proxy)
@@ -338,10 +338,10 @@ if [ "$1" = "status" ]; then
     else
         if get_status; then
             curr_proxy=$(cat "$STATE_FILE" 2>/dev/null || read_gnome_proxy)
-            echo "Proxy forcé actif sur ${TUN_NAME} -> ${curr_proxy} (Split Tunneling: ${split_mode}, Contournement FTP: ${ftp_desc})"
+            echo "Proxy routing active on ${TUN_NAME} -> ${curr_proxy} (Split tunneling: ${split_mode}, FTP bypass: ${ftp_desc})"
             exit 0
         else
-            echo "Proxy forcé inactif (Contournement FTP: ${ftp_desc})"
+            echo "Proxy routing inactive (FTP bypass: ${ftp_desc})"
             exit 0
         fi
     fi
@@ -367,16 +367,16 @@ if [ "$1" = "ftp-status" ]; then
         exit 0
     fi
 
-    echo "--- État du Contournement FTP NetPulse ---"
+    echo "--- NetPulse FTP Bypass Status ---"
     if [ "$bypass_ftp" = "1" ]; then
-        echo "Exemption FTP : Activée (Les flux FTP sont automatiquement acheminés hors du proxy)"
+        echo "FTP bypass: Enabled (FTP traffic automatically bypasses the proxy)"
     else
-        echo "Exemption FTP : Désactivée"
+        echo "FTP bypass: Disabled"
     fi
-    echo "Règles de routage noyau actives : $rules_active"
-    echo "Module conntrack FTP chargé : $ct_loaded"
-    echo "Ports exemptés : 20 (données actives), 21 (contrôle FTP), 989/990 (FTPS), ports passifs dynamiques"
-    echo "Applications FTP surveillées : FileZilla, gvfsd-ftp (Nautilus), lftp, ncftp, ftp, cyberduck"
+    echo "Active kernel routing rules: $rules_active"
+    echo "FTP conntrack module loaded: $ct_loaded"
+    echo "Bypassed ports: 20 (active data), 21 (FTP control), 989/990 (FTPS), dynamic passive ports"
+    echo "Monitored FTP applications: FileZilla, gvfsd-ftp (Nautilus), lftp, ncftp, ftp, cyberduck"
     echo "Processus en mode direct (cgroup net_direct) : $direct_pids"
     exit 0
 fi
@@ -386,7 +386,7 @@ fi
 # -------------------------------------------------------------
 if [ "$(id -u)" -ne 0 ]; then
     if [ ! -x "$ROOT_CTL" ]; then
-        echo "NetPulse: Le contrôleur privilégié est absent. Lancez ./install.sh depuis le projet." >&2
+        echo "NetPulse: The privileged controller is missing. Run ./install.sh from the project directory." >&2
         exit 1
     fi
     # 1. Try passwordless sudo first (configured via /etc/sudoers.d/netpulse)
@@ -405,7 +405,7 @@ if [ "$(id -u)" -ne 0 ]; then
     fi
 
     # 4. In background / daemon / boot mode, NEVER pop up graphical pkexec prompts!
-    echo "NetPulse: Privilèges root requis pour cette commande, mais la session est non-interactive et sudo sans mot de passe n'est pas encore actif." >&2
+    echo "NetPulse: This command requires root privileges, but the session is non-interactive and passwordless sudo is not configured." >&2
     exit 1
 fi
 
@@ -470,7 +470,7 @@ split_setup_rules() {
                 route_args+=(dev "$default_if")
             fi
             ip route replace "${route_args[@]}" table 200 || {
-                echo "Erreur: copie de la route directe vers la table 200 impossible (interface $default_if)." >&2
+                echo "Error: could not copy the direct route to table 200 (interface $default_if)." >&2
                 return 1
             }
         done < <(ip -4 route show dev "$default_if")
@@ -619,7 +619,7 @@ split_assign_pid() {
             case "$current" in /net_proxy|/net_direct) restore_cgroup "$target_pid" ;; *) return 0 ;; esac
             return $?
             ;;
-        *) echo "Destination de routage invalide : $destination" >&2; return 1 ;;
+        *) echo "Invalid routing destination: $destination" >&2; return 1 ;;
     esac
     [ "$current" = "${target#/sys/fs/cgroup}" ] && return 0
     remember_cgroup "$target_pid" || return 1
@@ -695,7 +695,7 @@ PYSOCKETS
 split_set_mode() {
     local new_mode="$1"
     if [ "$new_mode" != "disabled" ] && [ "$new_mode" != "include" ] && [ "$new_mode" != "exclude" ]; then
-        echo "Erreur: Mode invalide '$new_mode'. Choix possibles : disabled, include, exclude" >&2
+        echo "Error: Invalid mode '$new_mode'. Choose: disabled, include, exclude" >&2
         return 1
     fi
 
@@ -712,7 +712,7 @@ split_set_mode() {
         fi
         split_sync || return 1
     fi
-    echo "Mode Split Tunneling défini sur : $new_mode"
+    echo "Split tunneling mode set to: $new_mode"
 }
 
 case "$1" in
@@ -723,17 +723,17 @@ case "$1" in
         fi
 
         if [ -z "$proxy_arg" ]; then
-            echo "Erreur: Aucune adresse de proxy n'a été spécifiée ou trouvée dans GNOME Settings." >&2
+            echo "Error: No proxy address was provided or found in GNOME Settings." >&2
             exit 1
         fi
 
         if [ ! -x "$TUN2SOCKS_BIN" ]; then
-            echo "Erreur: Binaire tun2socks introuvable à $TUN2SOCKS_BIN" >&2
+            echo "Error: tun2socks binary not found at $TUN2SOCKS_BIN" >&2
             exit 1
         fi
         get_net_info
         if [ -z "$default_if" ]; then
-            echo "Erreur: Aucune interface réseau disponible." >&2
+            echo "Error: No network interface available." >&2
             exit 1
         fi
         proxy_ip=$(python3 - "$proxy_arg" <<'PYPROXY'
@@ -742,19 +742,19 @@ from urllib.parse import urlsplit
 try:
     proxy = urlsplit(sys.argv[1])
     if proxy.scheme not in ("socks5", "socks4", "http") or not proxy.hostname or not proxy.port:
-        raise ValueError("URL attendue : socks5://hôte:port, socks4://hôte:port ou http://hôte:port")
+        raise ValueError("Expected URL: socks5://host:port, socks4://host:port or http://host:port")
     print(socket.getaddrinfo(proxy.hostname, proxy.port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0])
 except (OSError, ValueError) as exc:
-    print(f"Erreur de proxy : {exc}", file=sys.stderr)
+    print(f"Proxy error: {exc}", file=sys.stderr)
     sys.exit(1)
 PYPROXY
         ) || exit 1
 
         install -d -o root -g root -m 755 /run/netpulse || exit 1
 
-        echo "Configuration du proxy forcé..."
+        echo "Configuring proxy routing..."
         echo "Proxy: $proxy_arg"
-        echo "Interface réseau physique: $default_if (GW: $default_gw)"
+        echo "Physical network interface: $default_if (GW: $default_gw)"
 
         if get_status; then
             "$REAL_SCRIPT" stop || exit 1
@@ -796,7 +796,7 @@ PYPROXY
 
         # 4. Start tun2socks with high-throughput auto-tuning & large netstack buffers
         if [ ! -x "$TUN2SOCKS_BIN" ]; then
-            echo "Erreur: Binaire tun2socks introuvable à $TUN2SOCKS_BIN" >&2
+            echo "Error: tun2socks binary not found at $TUN2SOCKS_BIN" >&2
             exit 1
         fi
 
@@ -820,7 +820,7 @@ PYPROXY
         sleep 0.5
 
         if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            echo "Erreur: tun2socks n'a pas démarré. Consultez $LOG_FILE." >&2
+            echo "Error: tun2socks did not start. See $LOG_FILE." >&2
             "$REAL_SCRIPT" stop >/dev/null 2>&1
             exit 1
         fi
@@ -850,12 +850,12 @@ PYPROXY
         fi
         pkill -f "/snap/snap-store" 2>/dev/null || true
 
-        echo "Succès: Tout le trafic du PC est désormais forcé vers $proxy_arg (Split Tunneling: $split_mode)"
+        echo "Success: IPv4 traffic is routed through $proxy_arg (Split Tunneling: $split_mode)"
         exit 0
         ;;
 
     stop)
-        echo "Désactivation du forçage proxy..."
+        echo "Stopping proxy routing..."
 
         # 1. Supprimer immédiatement les routes TUN 0.0.0.0/1 et 128.0.0.0/1
         # C'est la priorité absolue : le trafic repasse instantanément sur la route par défaut (WiFi/Ethernet/VPN) SANS AUCUNE COUPURE
@@ -897,12 +897,12 @@ PYPROXY
         sudo -u "$TARGET_USER" systemctl --user unset-environment http_proxy https_proxy all_proxy ALL_PROXY ftp_proxy FTP_PROXY 2>/dev/null || true
         snap unset system proxy.http proxy.https 2>/dev/null || true
 
-        echo "Succès: Forçage proxy désactivé. Le routage standard est restauré."
+        echo "Success: Proxy routing disabled. Standard routing restored."
         exit 0
         ;;
 
     optimize|tune)
-        echo "Application des optimisations de débit pour Every Proxy / Hotspot mobile..."
+        echo "Applying throughput optimizations for Every Proxy / mobile hotspot..."
         def_line=$(ip -4 route show default | head -n 1)
         default_if=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
         default_gw=$(echo "$def_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
@@ -944,7 +944,7 @@ PYPROXY
             echo $! > "$PID_FILE"
         fi
 
-        echo "Optimisations appliquées avec succès."
+        echo "Optimizations applied successfully."
         exit 0
         ;;
 
@@ -955,7 +955,7 @@ PYPROXY
         remember_cgroup "$target_pid" || exit 1
         printf '%s\n' "$target_pid" > "$CGROUP_BLOCKED/cgroup.procs" || exit 1
         kill_pid_sockets "$target_pid" || exit 1
-        echo "PID $target_pid bloqué avec succès."
+        echo "PID $target_pid blocked successfully."
         exit 0
         ;;
 
@@ -966,7 +966,7 @@ PYPROXY
         if [ "$current" = "/net_blocked" ]; then
             restore_cgroup "$target_pid" || exit 1
         fi
-        echo "PID $target_pid débloqué avec succès."
+        echo "PID $target_pid unblocked successfully."
         exit 0
         ;;
 
@@ -987,7 +987,7 @@ PYPROXY
             for p in $pids; do
                 "$REAL_SCRIPT" block "$p" || exit 1
             done
-            echo "Application $app_name bloquée."
+            echo "Application $app_name blocked."
             exit 0
         fi
         exit 1
@@ -1003,7 +1003,7 @@ PYPROXY
             for p in $pids; do
                 "$REAL_SCRIPT" unblock "$p" || exit 1
             done
-            echo "Application $app_name débloquée."
+            echo "Application $app_name unblocked."
             exit 0
         fi
         exit 1
@@ -1011,7 +1011,7 @@ PYPROXY
 
     firewall-init)
         firewall_init || exit 1
-        echo "Pare-feu applicatif initialisé avec succès."
+        echo "Application firewall initialized successfully."
         exit 0
         ;;
 
@@ -1028,14 +1028,14 @@ PYPROXY
         iptables -D OUTPUT -m cgroup --path net_blocked -j REJECT 2>/dev/null || true
         ip6tables -D OUTPUT -m cgroup --path net_blocked -j REJECT 2>/dev/null || true
         rmdir "$CGROUP_BLOCKED" 2>/dev/null || true
-        echo "Règles de pare-feu réinitialisées."
+        echo "Firewall rules reset."
         exit 0
         ;;
 
     update-sudoers)
         # sudo ne doit autoriser qu'un script installé appartenant à root.
         if [ "$REAL_SCRIPT" != "$ROOT_CTL" ] || [ "$(stat -c %u "$ROOT_CTL")" != "0" ]; then
-            echo "Erreur: Installez d'abord le contrôleur root avec ./install.sh." >&2
+            echo "Error: Install the root controller first with ./install.sh." >&2
             exit 1
         fi
         sudoers_tmp=$(mktemp) || exit 1
@@ -1046,7 +1046,7 @@ PYPROXY
         fi
         install -o root -g root -m 440 "$sudoers_tmp" /etc/sudoers.d/netpulse || exit 1
         rm -f "$sudoers_tmp" /etc/sudoers.d/force-proxy
-        echo "Configuration sudoers mise à jour avec succès."
+        echo "Sudoers configuration updated successfully."
         exit 0
         ;;
 
@@ -1067,13 +1067,13 @@ def trusted_read(path):
     with os.fdopen(fd, "r", encoding="utf-8") as stream:
         info = os.fstat(stream.fileno())
         if info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode):
-            raise ValueError(f"Fichier de migration non sûr : {path}")
+            raise ValueError(f"Unsafe migration file: {path}")
         return stream.read()
 if not os.path.exists(runtime + "/tun2socks.pid") and os.path.exists("/tmp/force-proxy.pid"):
     pid = int(trusted_read("/tmp/force-proxy.pid").strip())
     with open(f"/proc/{pid}/comm", encoding="utf-8") as stream:
         if stream.read().strip() != "tun2socks":
-            raise ValueError("Le PID historique n'appartient pas à tun2socks")
+            raise ValueError("The legacy PID does not belong to tun2socks")
     proxy = trusted_read("/tmp/force-proxy-current.txt").strip()
     # Le PID sert de marqueur de migration terminée, publié après le proxy.
     for name, content, mode in (("proxy.txt", proxy, 0o640), ("tun2socks.pid", str(pid), 0o644)):
@@ -1087,9 +1087,9 @@ if not os.path.exists(runtime + "/tun2socks.pid") and os.path.exists("/tmp/force
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-    print(f"Tunnel existant adopté, PID {pid}, sans redémarrage.")
+    print(f"Existing tunnel adopted, PID {pid}, without restarting.")
 else:
-    print("Contrôleur installé ; état du tunnel conservé.")
+    print("Controller installed; tunnel state preserved.")
 PYMIGRATE
         [ "$?" -eq 0 ] || exit 1
         "$ROOT_CTL" update-sudoers || exit 1
@@ -1117,10 +1117,10 @@ PYMIGRATE
             fi
             chown -R "$TARGET_USER:$TARGET_USER" "$SPLIT_DIR" 2>/dev/null || true
             if get_status; then split_sync || exit 1; fi
-            echo "Application '$app_lower' ajoutée au Split Tunneling."
+            echo "Application '$app_lower' added to split tunneling."
             exit 0
         fi
-        echo "Usage: $CMD_NAME split-add <nom_application>" >&2
+        echo "Usage: $CMD_NAME split-add <application_name>" >&2
         exit 1
         ;;
 
@@ -1130,10 +1130,10 @@ PYMIGRATE
             app_lower="$app_name"
             remove_exact_line "$SPLIT_FILE" "$app_lower" || exit 1
             if get_status; then split_sync || exit 1; fi
-            echo "Application '$app_lower' retirée du Split Tunneling."
+            echo "Application '$app_lower' removed from split tunneling."
             exit 0
         fi
-        echo "Usage: $CMD_NAME split-del <nom_application>" >&2
+        echo "Usage: $CMD_NAME split-del <application_name>" >&2
         exit 1
         ;;
 
@@ -1150,7 +1150,7 @@ PYMIGRATE
 
     split-sync)
         if get_status; then split_sync || exit 1; fi
-        echo "Synchronisation du Split Tunneling terminée."
+        echo "Split tunneling reconciliation completed."
         exit 0
         ;;
 
@@ -1159,9 +1159,9 @@ PYMIGRATE
         if [ -z "$action" ]; then
             curr=$(read_bypass_ftp)
             if [ "$curr" = "1" ]; then
-                echo "Contournement FTP actif (les transferts FTP contournent automatiquement le proxy)."
+                echo "FTP bypass enabled (FTP transfers automatically bypass the proxy)."
             else
-                echo "Contournement FTP inactif."
+                echo "FTP bypass disabled."
             fi
             exit 0
         fi
@@ -1172,7 +1172,7 @@ PYMIGRATE
                     split_setup_rules || exit 1
                     if get_status; then split_sync || exit 1; fi
                 fi
-                echo "Contournement FTP activé avec succès."
+                echo "FTP bypass enabled successfully."
                 exit 0
                 ;;
             off|disable|false|0)
@@ -1198,7 +1198,7 @@ PYMIGRATE
                     ip rule del ipproto tcp sport 989 table 200 priority 40 2>/dev/null || true
                     if get_status; then split_sync || exit 1; fi
                 fi
-                echo "Contournement FTP désactivé."
+                echo "FTP bypass disabled."
                 exit 0
                 ;;
             *)
